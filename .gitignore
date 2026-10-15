@@ -1,0 +1,38 @@
+# =========================
+# Python Environment & Cache
+# =========================
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# =========================
+# Project Logs & Telemetry
+# =========================
+logs/*.json
+logs/*.log
+
+# =========================
+# Test Recordings & Artifacts
+# =========================
+recording_engine/recordings/session_*/
+*.mp4
+*.png
+*.jpg
+
+# =========================
+# Sensitive / Local Configuration
+# =========================
+.env
+*.env
+
+# =========================
+# OS & Editor Generated
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

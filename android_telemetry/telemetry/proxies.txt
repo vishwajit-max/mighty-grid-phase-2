@@ -1,0 +1,43 @@
+# Free public HTTP proxies (tested+located 2026-09-16 12:46)
+# Format: host:port # Country City
+# Refresh: python network_telemetry_prep.py --refresh-free
+101.36.112.205:1081 # HK Kowloon Hong Kong
+102.208.228.90:8080 # ZA Eastern Cape Ducats
+103.237.102.191:11111 # DE Hesse Frankfurt am Main
+103.31.135.214:8080 # ID West Java Bekasi
+107.167.18.122:443 # US California Los Angeles
+111.119.162.248:10900 # PK Sindh Tando Adam
+111.119.162.248:10901 # PK Sindh Tando Adam
+111.119.162.248:10913 # PK Sindh Tando Adam
+111.119.162.248:10928 # PK Sindh Tando Adam
+111.119.162.248:10931 # PK Sindh Tando Adam
+123.0.19.42:10000 # BD Rajshahi Division Naogaon
+124.156.194.52:8080 # SG North West Singapore
+124.156.194.52:8081 # SG North West Singapore
+129.154.201.19:33128 # KR Seoul Seoul
+14.225.2.98:808 # VN Hanoi Hanoi
+14.251.13.20:8080 # VN Hanoi Hanoi
+152.53.183.107:8081 # DE Bavaria Nuremberg
+153.80.240.2:8080 # NL Limburg Eygelshoven
+154.59.56.74:999 # VE Mérida Tovar Municipality
+154.59.56.78:999 # VE Mérida Santa Cruz de Mora
+157.173.115.35:1081 # FR Grand Est Lauterbourg
+165.154.162.73:8888 # US California Los Angeles
+167.234.251.155:8880 # BR Sao Paulo São Paulo
+174.138.165.204:32986 # US Arizona Phoenix
+181.78.44.63:999 # HN Santa Bárbara Department La Unión
+183.164.45.77:81 # CN Anhui Hefei
+184.75.221.82:3118 # CA Ontario Toronto
+185.166.27.208:2020 # IQ Erbil Governorate Erbil
+185.196.61.251:8081 # CA Ontario Toronto
+185.226.194.0:999 # VE Carabobo Valencia
+185.58.115.185:8080 # SE Stockholm Stockholm
+186.33.45.219:999 # EC Cotopaxi Latacunga
+186.33.45.220:999 # EC Cotopaxi Latacunga
+187.190.58.152:80 # MX Sinaloa Mazatlán
+187.251.224.167:80 # MX Guanajuato San José de Durán
+196.75.251.159:1084 # MA Rabat-Salé-Kénitra Rabat
+198.46.200.118:12888 # US California Los Angeles
+205.164.192.115:999 # MX Jalisco Ayotlán
+210.211.113.35:80 # VN Ho Chi Minh Ho Chi Minh City
+210.79.140.130:8181 # ID Bali Gianyar
