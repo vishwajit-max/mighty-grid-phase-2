@@ -1,0 +1,54 @@
+{
+  "serial": "usb-default",
+  "package": "com.android.chrome",
+  "captured_at": "2026-10-16T16:53:22",
+  "method": "device-level (resetprop -n)",
+  "native_baseline": {
+    "Brand": "POCO",
+    "Manufacturer": "Xiaomi",
+    "Model": "23076PC4BI",
+    "Device": "sky",
+    "Product": "sky_p_in",
+    "Build": "AQ3A.240912.001",
+    "Fingerprint": "POCO/sky_p_in/sky:15/AQ3A.240912.001/OS2.0.204.0.VMWINXM:user/release-keys",
+    "SoC": "qcom",
+    "ABI": "arm64-v8a"
+  },
+  "configured_target": {
+    "Brand": "OnePlus",
+    "Manufacturer": "OnePlus",
+    "Model": "CPH2619",
+    "Device": "OP5D3C",
+    "Product": "CPH2619IN",
+    "Build": "UP1A.231005.007",
+    "Fingerprint": "OnePlus/CPH2619IN/OP5D3C:14/UP1A.231005.007/U.1f0e00-1:user/release-keys",
+    "SoC": "sm6375",
+    "ABI": "arm64-v8a"
+  },
+  "returned_after_override": {
+    "Brand": "OnePlus",
+    "Manufacturer": "OnePlus",
+    "Model": "CPH2619",
+    "Device": "OP5D3C",
+    "Product": "CPH2619IN",
+    "Build": "UP1A.231005.007",
+    "Fingerprint": "OnePlus/CPH2619IN/OP5D3C:14/UP1A.231005.007/U.1f0e00-1:user/release-keys",
+    "SoC": "sm6375",
+    "ABI": "arm64-v8a"
+  },
+  "status": {
+    "Brand": "PASS",
+    "Manufacturer": "PASS",
+    "Model": "PASS",
+    "Device": "PASS",
+    "Product": "PASS",
+    "Build": "PASS",
+    "Fingerprint": "PASS",
+    "SoC": "PASS",
+    "ABI": "PASS"
+  },
+  "revert": {
+    "how": "python -c \"import mighty_grid_run as m; m.revert_hardware_identity(None)\"",
+    "why": "writes the saved native_baseline back via resetprop -n; no reboot required"
+  }
+}

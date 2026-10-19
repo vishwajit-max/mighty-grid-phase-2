@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
+
 import lxml.etree as ET
 import uiautomator2 as u2
 import cv2
@@ -19,13 +20,13 @@ import numpy as np
 
 @dataclass
 class TouchSample:
-    t_offset_ms: int       # Milliseconds since POINTER_DOWN
-    x: int                 # Raw pixel X on recording device
-    y: int                 # Raw pixel Y on recording device
-    rx: float              # Normalized screen X (0.0 - 1.0)
-    ry: float              # Normalized screen Y (0.0 - 1.0)
-    dx_norm: float         # Delta from start_x normalized by screen width
-    dy_norm: float         # Delta from start_y normalized by screen height
+    t_offset_ms: int
+    x: int
+    y: int
+    rx: float
+    ry: float
+    dx_norm: float
+    dy_norm: float
     pressure: int = 50
 
 
@@ -36,8 +37,7 @@ class UIAnchor:
     content_desc: str = ""
     class_name: str = ""
     package: str = ""
-    bounds: Tuple[int, int, int, int] = (0, 0, 0, 0)  # (left, top, right, bottom)
-    # Relative hit position INSIDE the element's bounding box (0.0 to 1.0)
+    bounds: Tuple[int, int, int, int] = (0, 0, 0, 0)
     element_rx: float = 0.5
     element_ry: float = 0.5
     visual_crop_path: Optional[str] = None
@@ -47,35 +47,34 @@ class UIAnchor:
 class RecordedStep:
     step_id: int
     timestamp: float
-    think_time_ms: int             # Time elapsed since previous step completed
-    event_type: str                # TAP, LONG_PRESS, SWIPE, KEY_EVENT, TEXT_INPUT
+    think_time_ms: int
+    event_type: str
     pre_package: str
     pre_activity: str
-    orientation: int               # 0=Portrait, 1=Landscape-90, 3=Landscape-270
-    # Populated for touch events
+    orientation: int
     anchor: Optional[UIAnchor] = None
     end_anchor: Optional[UIAnchor] = None
     duration_ms: int = 0
     trajectory: List[TouchSample] = field(default_factory=list)
-    # Populated for KEY_EVENT or TEXT_INPUT
     keycode: Optional[int] = None
     text_payload: Optional[str] = None
 
 
 # =====================================================================
-# 2. MAATOUCH STREAM CONTROLLER (0ms Pass-Through + Key/Text Injection)
+# 2. MAATOUCH STREAM CONTROLLER
 # =====================================================================
 
 class MaaTouchDriver:
-    """
-    Manages a persistent adb shell app_process pipe to MaaTouch.
-    Auto-pushes the binary if missing on the target device.
-    """
+    """Manage a persistent ADB shell app_process pipe to MaaTouch."""
+
     def __init__(
         self,
         serial: str,
-        local_maatouch_path: str = r"C:\Users\RDP6\Downloads\Phase-2\android_telemetry\telemetry\maatouch",
-        maatouch_remote_path: str = "/data/local/tmp/maatouch"
+        local_maatouch_path: str = (
+            r"C:\Users\RDP6\Downloads\Phase-2"
+            r"\android_telemetry\telemetry\maatouch"
+        ),
+        maatouch_remote_path: str = "/data/local/tmp/maatouch",
     ):
         self.serial = serial
         self.local_path = local_maatouch_path
@@ -88,35 +87,80 @@ class MaaTouchDriver:
 
     def _ensure_binary_on_device(self):
         check = subprocess.run(
-            ["adb", "-s", self.serial, "shell", f"ls {self.remote_path}"],
-            capture_output=True, text=True
+            [
+                "adb", "-s", self.serial, "shell",
+                f"ls {self.remote_path}",
+            ],
+            capture_output=True,
+            text=True,
         )
+
         if check.returncode != 0:
             search_root = Path(__file__).resolve().parent.parent
             candidates = list(search_root.rglob("*maatouch*"))
-            candidates = [c for c in candidates if c.is_file() and not c.name.endswith(".py")]
-            if self.local_path and Path(self.local_path).exists():
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.is_file()
+                and not candidate.name.endswith(".py")
+            ]
+
+            if (
+                self.local_path
+                and Path(self.local_path).exists()
+            ):
                 src = self.local_path
             elif candidates:
                 src = str(candidates[0])
             else:
-                print(f"[!] WARNING: Could not find local maatouch binary in {search_root} to push to {self.serial}!")
+                print(
+                    "[!] WARNING: Could not find local MaaTouch binary "
+                    f"in {search_root} for {self.serial}."
+                )
                 return
 
-            print(f"[*] Pushing {src} -> {self.serial}:{self.remote_path} ...")
-            subprocess.run(["adb", "-s", self.serial, "push", src, self.remote_path], check=True)
-            subprocess.run(["adb", "-s", self.serial, "shell", f"chmod 777 {self.remote_path}"], check=True)
+            print(
+                f"[*] Pushing {src} -> "
+                f"{self.serial}:{self.remote_path} ..."
+            )
+
+            subprocess.run(
+                [
+                    "adb", "-s", self.serial, "push",
+                    src, self.remote_path,
+                ],
+                check=True,
+            )
+
+            subprocess.run(
+                [
+                    "adb", "-s", self.serial, "shell",
+                    f"chmod 777 {self.remote_path}",
+                ],
+                check=True,
+            )
 
     def _query_wm_size_fallback(self):
-        res = subprocess.run(
-            ["adb", "-s", self.serial, "shell", "wm", "size"],
-            capture_output=True, text=True
+        result = subprocess.run(
+            [
+                "adb", "-s", self.serial, "shell",
+                "wm", "size",
+            ],
+            capture_output=True,
+            text=True,
         )
-        for line in res.stdout.splitlines():
+
+        for line in result.stdout.splitlines():
             if "size:" in line:
                 dims = line.split(":")[-1].strip().split("x")
-                if len(dims) == 2 and dims[0].isdigit() and dims[1].isdigit():
-                    self.max_x, self.max_y = int(dims[0]), int(dims[1])
+
+                if (
+                    len(dims) == 2
+                    and dims[0].isdigit()
+                    and dims[1].isdigit()
+                ):
+                    self.max_x = int(dims[0])
+                    self.max_y = int(dims[1])
 
     def start(self):
         self._ensure_binary_on_device()
@@ -124,51 +168,92 @@ class MaaTouchDriver:
 
         cmd = [
             "adb", "-s", self.serial, "shell",
-            f"CLASSPATH={self.remote_path} app_process / com.shxyke.MaaTouch.App"
+            (
+                f"CLASSPATH={self.remote_path} "
+                "app_process / com.shxyke.MaaTouch.App"
+            ),
         ]
+
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            bufsize=1
+            bufsize=1,
         )
 
-        header_Holder = []
-        def _read_hdr():
+        header_holder = []
+
+        def _read_header():
             try:
                 line = self.proc.stdout.readline().strip()
-                header_Holder.append(line)
+                header_holder.append(line)
             except Exception:
                 pass
 
-        t = threading.Thread(target=_read_hdr, daemon=True)
-        t.start()
-        t.join(timeout=2.0)
+        thread = threading.Thread(
+            target=_read_header,
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=2.0)
 
-        if header_Holder and header_Holder[0].startswith("^"):
-            parts = header_Holder[0].split()
+        if (
+            header_holder
+            and header_holder[0].startswith("^")
+        ):
+            parts = header_holder[0].split()
             self.max_x = int(parts[2])
             self.max_y = int(parts[3])
             self.max_pressure = int(parts[4])
-            print(f"[+] MaaTouch connected on {self.serial}: {self.max_x}x{self.max_y} (max_p={self.max_pressure})")
+
+            print(
+                f"[+] MaaTouch connected on {self.serial}: "
+                f"{self.max_x}x{self.max_y} "
+                f"(max_p={self.max_pressure})"
+            )
         else:
-            err = header_Holder[0] if header_Holder else "timeout waiting for '^' header"
-            print(f"[!] MaaTouch startup warning ({err}). Using wm size {self.max_x}x{self.max_y}.")
+            error = (
+                header_holder[0]
+                if header_holder
+                else "timeout waiting for '^' header"
+            )
+
+            print(
+                f"[!] MaaTouch startup warning ({error}). "
+                f"Using wm size {self.max_x}x{self.max_y}."
+            )
 
     def _send(self, payload: str):
         if not self.proc or not self.proc.stdin:
             return
+
         with self._lock:
             self.proc.stdin.write(payload)
             self.proc.stdin.flush()
 
-    def touch_down(self, pointer_id: int, x: int, y: int, pressure: int = 50):
-        self._send(f"d {pointer_id} {x} {y} {pressure}\nc\n")
+    def touch_down(
+        self,
+        pointer_id: int,
+        x: int,
+        y: int,
+        pressure: int = 50,
+    ):
+        self._send(
+            f"d {pointer_id} {x} {y} {pressure}\nc\n"
+        )
 
-    def touch_move(self, pointer_id: int, x: int, y: int, pressure: int = 50):
-        self._send(f"m {pointer_id} {x} {y} {pressure}\nc\n")
+    def touch_move(
+        self,
+        pointer_id: int,
+        x: int,
+        y: int,
+        pressure: int = 50,
+    ):
+        self._send(
+            f"m {pointer_id} {x} {y} {pressure}\nc\n"
+        )
 
     def touch_up(self, pointer_id: int):
         self._send(f"u {pointer_id}\nc\n")
@@ -177,6 +262,7 @@ class MaaTouchDriver:
         self._send(f"k {keycode} o\nc\n")
 
     def input_text(self, text: str):
+        """Retained for existing callers that use MaaTouch text input."""
         sanitized = text.replace("\n", " ")
         self._send(f"t {sanitized}\nc\n")
 
@@ -192,20 +278,24 @@ class MaaTouchDriver:
 
 class DeviceStateCache:
     """
-    Continuously refreshes the UI hierarchy and foreground activity during idle windows
-    so POINTER_DOWN can resolve the clicked UI element in <1ms without blocking.
+    Refresh the UI hierarchy and activity during idle windows so touch-down
+    can resolve the clicked element without blocking the gesture path.
     """
+
     def __init__(self, serial: str):
         self.u2_dev = u2.connect(serial)
         self.latest_xml: Optional[str] = None
         self.latest_package: str = ""
         self.latest_activity: str = ""
         self.orientation: int = 0
-        self.is_touch_active: bool = False
-        self.last_interaction_ts: float = 0.0
+        self.is_touch_active = False
+        self.last_interaction_ts = 0.0
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
-        self._worker = threading.Thread(target=self._poll_loop, daemon=True)
+        self._worker = threading.Thread(
+            target=self._poll_loop,
+            daemon=True,
+        )
 
     def start(self):
         self._refresh_now()
@@ -221,9 +311,14 @@ class DeviceStateCache:
 
     def _poll_loop(self):
         while not self._stop_event.is_set():
-            idle_Elapsed = time.perf_counter() - self.last_interaction_ts
-            # Refresh when user is not touching and 350ms have settled after last action
-            if not self.is_touch_active and idle_Elapsed >= 0.35:
+            idle_elapsed = (
+                time.perf_counter() - self.last_interaction_ts
+            )
+
+            if (
+                not self.is_touch_active
+                and idle_elapsed >= 0.35
+            ):
                 self._refresh_now()
                 time.sleep(0.4)
             else:
@@ -232,29 +327,41 @@ class DeviceStateCache:
     def _refresh_now(self):
         try:
             app_info = self.u2_dev.app_current()
-            xml_dump = self.u2_dev.dump_hierarchy(compressed=False)
-            orient = self.u2_dev.info.get("displayRotation", 0)
+            xml_dump = self.u2_dev.dump_hierarchy(
+                compressed=False
+            )
+            orientation = self.u2_dev.info.get(
+                "displayRotation",
+                0,
+            )
+
             with self._lock:
                 self.latest_package = app_info.get("package", "")
                 self.latest_activity = app_info.get("activity", "")
                 self.latest_xml = xml_dump
-                self.orientation = orient
+                self.orientation = orientation
+
         except Exception:
             pass
 
-    def get_snapshot(self) -> Tuple[str, str, int, Optional[str]]:
+    def get_snapshot(
+        self,
+    ) -> Tuple[str, str, int, Optional[str]]:
         with self._lock:
             return (
                 self.latest_package,
                 self.latest_activity,
                 self.orientation,
-                self.latest_xml
+                self.latest_xml,
             )
 
-    def resolve_node_at(self, x: int, y: int, xml_str: Optional[str]) -> UIAnchor:
-        """
-        Finds the deepest, smallest-area clickable/leaf UI node enclosing (x, y).
-        """
+    def resolve_node_at(
+        self,
+        x: int,
+        y: int,
+        xml_str: Optional[str],
+    ) -> UIAnchor:
+        """Find the smallest identifiable UI node containing (x, y)."""
         if not xml_str:
             return UIAnchor()
 
@@ -268,42 +375,64 @@ class DeviceStateCache:
 
         for elem in root.iter("node"):
             bounds_str = elem.attrib.get("bounds", "")
+
             if not bounds_str:
                 continue
-            # Format: "[left,top][right,bottom]"
-            parts = bounds_str.replace("][", ",").strip("[]").split(",")
-            l, t, r, b = map(int, parts)
-            if l <= x <= r and t <= y <= b:
-                w, h = (r - l), (b - t)
-                area = w * h
+
+            parts = (
+                bounds_str
+                .replace("][", ",")
+                .strip("[]")
+                .split(",")
+            )
+
+            try:
+                left, top, right, bottom = map(int, parts)
+            except ValueError:
+                continue
+
+            if (
+                left <= x <= right
+                and top <= y <= bottom
+            ):
+                width = right - left
+                height = bottom - top
+                area = width * height
+
                 if area <= 0:
                     continue
-                # Prefer nodes with semantic identifiers or smaller area
+
                 has_id = bool(
                     elem.attrib.get("resource-id")
                     or elem.attrib.get("text")
                     or elem.attrib.get("content-desc")
                 )
-                effective_score = area * (0.5 if has_id else 1.0)
-                if effective_score <= smallest_area:
-                    smallest_area = effective_score
-                    best_node = (elem, (l, t, r, b))
+
+                score = area * (0.5 if has_id else 1.0)
+
+                if score <= smallest_area:
+                    smallest_area = score
+                    best_node = (
+                        elem,
+                        (left, top, right, bottom),
+                    )
 
         if not best_node:
             return UIAnchor()
 
-        elem, (l, t, r, b) = best_node
-        w = max(1, r - l)
-        h = max(1, b - t)
+        elem, (left, top, right, bottom) = best_node
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+
         return UIAnchor(
             resource_id=elem.attrib.get("resource-id", ""),
             text=elem.attrib.get("text", ""),
             content_desc=elem.attrib.get("content-desc", ""),
             class_name=elem.attrib.get("class", ""),
             package=elem.attrib.get("package", ""),
-            bounds=(l, t, r, b),
-            element_rx=round((x - l) / w, 4),
-            element_ry=round((y - t) / h, 4)
+            bounds=(left, top, right, bottom),
+            element_rx=round((x - left) / width, 4),
+            element_ry=round((y - top) / height, 4),
         )
 
     def stop(self):
@@ -316,14 +445,24 @@ class DeviceStateCache:
 
 class AndroidRecordingEngine:
     """
-    Hook this directly into your host viewport UI (PyQt / PySide / WebSocket canvas).
+    Record viewport gestures and semantic actions from the host UI.
     """
-    def __init__(self, serial: str, session_dir: str = "./recordings"):
+
+    def __init__(
+        self,
+        serial: str,
+        session_dir: str = "./recordings",
+    ):
         self.serial = serial
         self.session_id = uuid.uuid4().hex[:8]
-        self.output_dir = Path(session_dir) / f"session_{self.session_id}"
+        self.output_dir = (
+            Path(session_dir) / f"session_{self.session_id}"
+        )
         self.crops_dir = self.output_dir / "crops"
-        self.crops_dir.mkdir(parents=True, exist_ok=True)
+        self.crops_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
         self.maatouch = MaaTouchDriver(serial)
         self.state_cache = DeviceStateCache(serial)
@@ -332,10 +471,16 @@ class AndroidRecordingEngine:
         self._step_counter = 0
         self._last_step_end_ts = time.perf_counter()
 
+        # Start time for a live text-edit session. The completed text is
+        # recorded as one TEXT_INPUT step when the user presses Enter/Inject.
+        self._live_text_started_at: Optional[float] = None
+
         # Active gesture state
         self._active_samples: List[TouchSample] = []
         self._down_ts: float = 0.0
-        self._pre_touch_snapshot: Optional[Tuple[str, str, int, Optional[str]]] = None
+        self._pre_touch_snapshot: Optional[
+            Tuple[str, str, int, Optional[str]]
+        ] = None
         self._pre_touch_frame: Optional[np.ndarray] = None
         self._latest_video_frame: Optional[np.ndarray] = None
 
@@ -345,113 +490,189 @@ class AndroidRecordingEngine:
         self._last_step_end_ts = time.perf_counter()
 
     def update_mirror_frame(self, frame_bgr: np.ndarray):
-        """
-        Call this from your scrcpy/video decode callback on every new frame.
-        """
+        """Receive frames from the scrcpy/video decode callback."""
         self._latest_video_frame = frame_bgr
 
     # -----------------------------------------------------------------
-    # VIEWPORT TOUCH HOOKS (Call from host mouse/touch event handlers)
+    # VIEWPORT TOUCH HOOKS
     # -----------------------------------------------------------------
 
-    def on_viewport_pointer_down(self, device_x: int, device_y: int, pressure: int = 50):
-        # 1. Immediate pass-through to MaaTouch (0ms perceived latency)
-        self.maatouch.touch_down(0, device_x, device_y, pressure)
+    def on_viewport_pointer_down(
+        self,
+        device_x: int,
+        device_y: int,
+        pressure: int = 50,
+    ):
+        self.maatouch.touch_down(
+            0,
+            device_x,
+            device_y,
+            pressure,
+        )
 
-        # 2. Freeze pre-touch state before UI transitions
         self.state_cache.notify_interaction_start()
         self._down_ts = time.perf_counter()
         self._pre_touch_snapshot = self.state_cache.get_snapshot()
-        if self._latest_video_frame is not None:
-            self._pre_touch_frame = self._latest_video_frame.copy()
 
-        w, h = self.maatouch.max_x, self.maatouch.max_y
+        if self._latest_video_frame is not None:
+            self._pre_touch_frame = (
+                self._latest_video_frame.copy()
+            )
+
+        width = self.maatouch.max_x
+        height = self.maatouch.max_y
+
         self._active_samples = [
             TouchSample(
                 t_offset_ms=0,
                 x=device_x,
                 y=device_y,
-                rx=round(device_x / w, 4),
-                ry=round(device_y / h, 4),
+                rx=round(device_x / width, 4),
+                ry=round(device_y / height, 4),
                 dx_norm=0.0,
                 dy_norm=0.0,
-                pressure=pressure
+                pressure=pressure,
             )
         ]
 
-    def on_viewport_pointer_move(self, device_x: int, device_y: int, pressure: int = 50):
+    def on_viewport_pointer_move(
+        self,
+        device_x: int,
+        device_y: int,
+        pressure: int = 50,
+    ):
         if not self._active_samples:
             return
-        self.maatouch.touch_move(0, device_x, device_y, pressure)
 
-        t_offset = int((time.perf_counter() - self._down_ts) * 1000)
-        # Deduplicate stationary sub-millisecond mouse jitter
+        self.maatouch.touch_move(
+            0,
+            device_x,
+            device_y,
+            pressure,
+        )
+
+        t_offset = int(
+            (time.perf_counter() - self._down_ts) * 1000
+        )
         last = self._active_samples[-1]
-        if last.x == device_x and last.y == device_y and (t_offset - last.t_offset_ms) < 8:
+
+        if (
+            last.x == device_x
+            and last.y == device_y
+            and t_offset - last.t_offset_ms < 8
+        ):
             return
 
-        w, h = self.maatouch.max_x, self.maatouch.max_y
+        width = self.maatouch.max_x
+        height = self.maatouch.max_y
         start = self._active_samples[0]
+
         self._active_samples.append(
             TouchSample(
                 t_offset_ms=t_offset,
                 x=device_x,
                 y=device_y,
-                rx=round(device_x / w, 4),
-                ry=round(device_y / h, 4),
-                dx_norm=round((device_x - start.x) / w, 4),
-                dy_norm=round((device_y - start.y) / h, 4),
-                pressure=pressure
+                rx=round(device_x / width, 4),
+                ry=round(device_y / height, 4),
+                dx_norm=round(
+                    (device_x - start.x) / width,
+                    4,
+                ),
+                dy_norm=round(
+                    (device_y - start.y) / height,
+                    4,
+                ),
+                pressure=pressure,
             )
         )
 
-    def on_viewport_pointer_up(self, device_x: int, device_y: int):
+    def on_viewport_pointer_up(
+        self,
+        device_x: int,
+        device_y: int,
+    ):
         if not self._active_samples:
             return
+
         self.maatouch.touch_up(0)
         self.state_cache.notify_interaction_end()
 
         now = time.perf_counter()
-        duration_ms = int((now - self._down_ts) * 1000)
-        think_time_ms = int((self._down_ts - self._last_step_end_ts) * 1000)
+        duration_ms = int(
+            (now - self._down_ts) * 1000
+        )
+        think_time_ms = int(
+            (self._down_ts - self._last_step_end_ts) * 1000
+        )
         self._last_step_end_ts = now
 
-        # Append final release sample
-        w, h = self.maatouch.max_x, self.maatouch.max_y
+        width = self.maatouch.max_x
+        height = self.maatouch.max_y
         start = self._active_samples[0]
+
         self._active_samples.append(
             TouchSample(
                 t_offset_ms=duration_ms,
                 x=device_x,
                 y=device_y,
-                rx=round(device_x / w, 4),
-                ry=round(device_y / h, 4),
-                dx_norm=round((device_x - start.x) / w, 4),
-                dy_norm=round((device_y - start.y) / h, 4),
-                pressure=0
+                rx=round(device_x / width, 4),
+                ry=round(device_y / height, 4),
+                dx_norm=round(
+                    (device_x - start.x) / width,
+                    4,
+                ),
+                dy_norm=round(
+                    (device_y - start.y) / height,
+                    4,
+                ),
+                pressure=0,
             )
         )
 
-        # Classify gesture: TAP vs LONG_PRESS vs SWIPE
-        pixel_dist = math.hypot(device_x - start.x, device_y - start.y)
-        if pixel_dist > max(w, h) * 0.025:
+        pixel_dist = math.hypot(
+            device_x - start.x,
+            device_y - start.y,
+        )
+
+        if pixel_dist > max(width, height) * 0.025:
             gesture_type = "SWIPE"
         elif duration_ms >= 500:
             gesture_type = "LONG_PRESS"
         else:
             gesture_type = "TAP"
 
-        pkg, act, orient, xml_str = self._pre_touch_snapshot or ("", "", 0, None)
-        start_anchor = self.state_cache.resolve_node_at(start.x, start.y, xml_str)
+        (
+            pkg,
+            activity,
+            orientation,
+            xml_str,
+        ) = self._pre_touch_snapshot or ("", "", 0, None)
+
+        start_anchor = self.state_cache.resolve_node_at(
+            start.x,
+            start.y,
+            xml_str,
+        )
+
         end_anchor = (
-            self.state_cache.resolve_node_at(device_x, device_y, xml_str)
-            if gesture_type == "SWIPE" else None
+            self.state_cache.resolve_node_at(
+                device_x,
+                device_y,
+                xml_str,
+            )
+            if gesture_type == "SWIPE"
+            else None
         )
 
         self._step_counter += 1
-        # Save visual template crop around touch-down point for fallback matching
+
         if self._pre_touch_frame is not None:
-            crop_file = self._save_visual_crop(self._step_counter, start.x, start.y, start_anchor.bounds)
+            crop_file = self._save_visual_crop(
+                self._step_counter,
+                start.x,
+                start.y,
+                start_anchor.bounds,
+            )
             start_anchor.visual_crop_path = crop_file
 
         step = RecordedStep(
@@ -460,13 +681,14 @@ class AndroidRecordingEngine:
             think_time_ms=max(0, think_time_ms),
             event_type=gesture_type,
             pre_package=pkg,
-            pre_activity=act,
-            orientation=orient,
+            pre_activity=activity,
+            orientation=orientation,
             anchor=start_anchor,
             end_anchor=end_anchor,
             duration_ms=duration_ms,
-            trajectory=list(self._active_samples)
+            trajectory=list(self._active_samples),
         )
+
         self.steps.append(step)
         self._active_samples.clear()
 
@@ -475,20 +697,24 @@ class AndroidRecordingEngine:
     # -----------------------------------------------------------------
 
     def on_viewport_key_event(self, keycode: int):
-        """
-        Bind host toolbar buttons or shortcuts here:
-        Back=4, Home=3, AppSwitch=187, VolUp=24, VolDown=25, Power=26, Enter=66
-        """
+        """Record a hardware-key action."""
         now = time.perf_counter()
-        think_time_ms = int((now - self._last_step_end_ts) * 1000)
+        think_time_ms = int(
+            (now - self._last_step_end_ts) * 1000
+        )
         self._last_step_end_ts = now
 
         self.state_cache.notify_interaction_start()
-        pkg, act, orient, _ = self.state_cache.get_snapshot()
+
+        pkg, activity, orientation, _ = (
+            self.state_cache.get_snapshot()
+        )
+
         self.maatouch.press_key(keycode)
         self.state_cache.notify_interaction_end()
 
         self._step_counter += 1
+
         self.steps.append(
             RecordedStep(
                 step_id=self._step_counter,
@@ -496,68 +722,211 @@ class AndroidRecordingEngine:
                 think_time_ms=max(0, think_time_ms),
                 event_type="KEY_EVENT",
                 pre_package=pkg,
-                pre_activity=act,
-                orientation=orient,
-                keycode=keycode
+                pre_activity=activity,
+                orientation=orientation,
+                keycode=keycode,
             )
         )
 
-    def on_viewport_text_input(self, text: str):
+    def on_viewport_text_edit(
+        self,
+        previous_text: str,
+        current_text: str,
+    ) -> bool:
         """
-        Call when the tester submits text via host keyboard or 'Send Text' bar.
-        Uses uiautomator2 FastInputIME / MaaTouch 't' command so replay works
-        identically across Gboard (Poco/Realme) and Samsung Keyboard.
+        Mirror edits from the desktop injection bar to the focused Android
+        field while the user types.
+
+        This tracks text owned by the injection bar. It assumes the Android
+        caret remains at the end of the injected text; normal typing, paste,
+        backspace and suffix replacement are supported.
         """
-        now = time.perf_counter()
-        think_time_ms = int((now - self._last_step_end_ts) * 1000)
-        self._last_step_end_ts = now
+        previous_text = str(previous_text)
+        current_text = str(current_text)
+
+        if previous_text == current_text:
+            return True
+
+        if current_text and self._live_text_started_at is None:
+            self._live_text_started_at = time.perf_counter()
+
+        common_length = min(
+            len(previous_text),
+            len(current_text),
+        )
+
+        prefix_length = 0
+
+        while (
+            prefix_length < common_length
+            and previous_text[prefix_length] == current_text[prefix_length]
+        ):
+            prefix_length += 1
+
+        delete_count = len(previous_text) - prefix_length
+        replacement = current_text[prefix_length:]
 
         self.state_cache.notify_interaction_start()
-        pkg, act, orient, _ = self.state_cache.get_snapshot()
-        # Inject via MaaTouch text command
-        self.maatouch.input_text(text)
-        self.state_cache.notify_interaction_end()
+
+        try:
+            # Remove the previous suffix from the end of the phone field.
+            for _ in range(delete_count):
+                self.state_cache.u2_dev.press("delete")
+
+            # Append only the newly typed/replaced suffix.
+            if replacement:
+                self.state_cache.u2_dev.send_keys(
+                    replacement,
+                    clear=False,
+                )
+
+        except Exception as exc:
+            print(
+                f"[!] Live text synchronization failed: {exc}"
+            )
+            return False
+
+        finally:
+            self.state_cache.notify_interaction_end()
+
+        if not current_text:
+            self._live_text_started_at = None
+
+        return True
+
+    def on_viewport_text_input(
+        self,
+        text: str,
+        already_injected: bool = False,
+    ) -> bool:
+        """
+        Record the completed semantic text action.
+
+        If already_injected=True, the text has already been mirrored to the
+        phone character-by-character; do not inject the same text twice.
+        """
+        payload = str(text)
+
+        if not payload.strip():
+            return False
+
+        action_started_at = (
+            self._live_text_started_at
+            if (
+                already_injected
+                and self._live_text_started_at is not None
+            )
+            else time.perf_counter()
+        )
+
+        think_time_ms = max(
+            0,
+            int(
+                (
+                    action_started_at
+                    - self._last_step_end_ts
+                ) * 1000
+            ),
+        )
+
+        self.state_cache.notify_interaction_start()
+
+        try:
+            (
+                pkg,
+                activity,
+                orientation,
+                _,
+            ) = self.state_cache.get_snapshot()
+
+            if not already_injected:
+                self.state_cache.u2_dev.send_keys(
+                    payload,
+                    clear=False,
+                )
+
+        except Exception as exc:
+            print(
+                f"[!] Phone text injection failed: {exc}"
+            )
+            return False
+
+        finally:
+            self.state_cache.notify_interaction_end()
 
         self._step_counter += 1
+
         self.steps.append(
             RecordedStep(
                 step_id=self._step_counter,
                 timestamp=time.time(),
-                think_time_ms=max(0, think_time_ms),
+                think_time_ms=think_time_ms,
                 event_type="TEXT_INPUT",
                 pre_package=pkg,
-                pre_activity=act,
-                orientation=orient,
-                text_payload=text
+                pre_activity=activity,
+                orientation=orientation,
+                text_payload=payload,
             )
         )
+
+        self._last_step_end_ts = time.perf_counter()
+        self._live_text_started_at = None
+
+        print(
+            f"[+] Recorded TEXT_INPUT "
+            f"(step #{self._step_counter}, "
+            f"{len(payload)} characters)"
+        )
+
+        return True
 
     # -----------------------------------------------------------------
     # VISUAL FALLBACK & SERIALIZATION
     # -----------------------------------------------------------------
 
     def _save_visual_crop(
-        self, step_id: int, x: int, y: int, bounds: Tuple[int, int, int, int]
+        self,
+        step_id: int,
+        x: int,
+        y: int,
+        bounds: Tuple[int, int, int, int],
     ) -> Optional[str]:
         frame = self._pre_touch_frame
+
         if frame is None:
             return None
-        fh, fw = frame.shape[:2]
-        l, t, r, b = bounds
-        # Use element bounds if valid and reasonably sized; otherwise 140x140 patch around (x, y)
-        if 0 < (r - l) < fw * 0.8 and 0 < (b - t) < fh * 0.5:
-            x1, y1, x2, y2 = max(0, l), max(0, t), min(fw, r), min(fh, b)
+
+        frame_height, frame_width = frame.shape[:2]
+        left, top, right, bottom = bounds
+
+        if (
+            0 < right - left < frame_width * 0.8
+            and 0 < bottom - top < frame_height * 0.5
+        ):
+            x1 = max(0, left)
+            y1 = max(0, top)
+            x2 = min(frame_width, right)
+            y2 = min(frame_height, bottom)
         else:
             half = 70
-            x1, y1 = max(0, x - half), max(0, y - half)
-            x2, y2 = min(fw, x + half), min(fh, y + half)
+            x1 = max(0, x - half)
+            y1 = max(0, y - half)
+            x2 = min(frame_width, x + half)
+            y2 = min(frame_height, y + half)
 
         crop = frame[y1:y2, x1:x2]
+
         if crop.size == 0:
             return None
-        rel_path = f"crops/step_{step_id:03d}.png"
-        cv2.imwrite(str(self.output_dir / rel_path), crop)
-        return rel_path
+
+        relative_path = f"crops/step_{step_id:03d}.png"
+
+        cv2.imwrite(
+            str(self.output_dir / relative_path),
+            crop,
+        )
+
+        return relative_path
 
     def stop_and_export(self) -> Path:
         self.state_cache.stop()
@@ -568,11 +937,20 @@ class AndroidRecordingEngine:
             "source_device_serial": self.serial,
             "source_resolution": {
                 "width": self.maatouch.max_x,
-                "height": self.maatouch.max_y
+                "height": self.maatouch.max_y,
             },
             "total_steps": len(self.steps),
-            "steps": [asdict(s) for s in self.steps]
+            "steps": [
+                asdict(step)
+                for step in self.steps
+            ],
         }
+
         out_file = self.output_dir / "recording.json"
-        out_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        out_file.write_text(
+            json.dumps(payload, indent=2),
+            encoding="utf-8",
+        )
+
         return out_file

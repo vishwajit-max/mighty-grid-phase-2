@@ -1,8 +1,11 @@
+import argparse
 import concurrent.futures
 import json
 import math
+import random
 import sys
 import time
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -10,41 +13,397 @@ import cv2
 import lxml.etree as ET
 import numpy as np
 import uiautomator2 as u2
-import threading
 
 from recorder_engine import MaaTouchDriver
 
 
 # =====================================================================
-# 1. OEM POPUP & PERMISSION WATCHER (Realme UI / One UI / HyperOS)
+# PERSONA / QA MOTION PROFILE INTEGRATION
+# =====================================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PERSONA_DIR = PROJECT_ROOT / "android_telemetry" / "telemetry"
+
+if str(PERSONA_DIR) not in sys.path:
+    sys.path.insert(0, str(PERSONA_DIR))
+
+try:
+    import personas
+except ImportError as exc:
+    raise ImportError(
+        f"Could not import personas.py from {PERSONA_DIR}. "
+        "Verify the project folder structure."
+    ) from exc
+
+
+KINEMATIC_LAWS = {
+    "speedy": "ease_out_quad",
+    "careful": "ease_in_out_sine",
+    "average": "smoothstep",
+    "shaky": "smoothstep",
+    "restless": "ease_in_quad",
+    "careless": "careless_blend",
+}
+
+TARGET_TOUCH_RATE_HZ = 75
+
+REPLAY_PROFILES = {
+    "baseline": {
+        "label": "Recorded timing",
+        "timing_scale": 1.0,
+    },
+    "slow": {
+        "label": "Slower QA timing",
+        "timing_scale": 1.5,
+    },
+    "fast": {
+        "label": "Faster QA timing",
+        "timing_scale": 0.75,
+    },
+}
+
+
+def apply_kinematic_law(
+    progress: float,
+    law: str,
+) -> float:
+    """Return bounded progress while preserving exact endpoints."""
+    t = max(0.0, min(1.0, float(progress)))
+
+    if law == "linear":
+        value = t
+
+    elif law == "ease_out_quad":
+        value = 1.0 - (1.0 - t) ** 2
+
+    elif law == "ease_in_quad":
+        value = t ** 2
+
+    elif law == "ease_in_out_sine":
+        value = (1.0 - math.cos(math.pi * t)) / 2.0
+
+    elif law == "smoothstep":
+        value = t * t * (3.0 - 2.0 * t)
+
+    elif law == "ease_out_cubic":
+        value = 1.0 - (1.0 - t) ** 3
+
+    elif law == "careless_blend":
+        # Keep careless swipes brisk without an excessively abrupt launch.
+        cubic = 1.0 - (1.0 - t) ** 3
+        smooth = t * t * (3.0 - 2.0 * t)
+        value = 0.65 * cubic + 0.35 * smooth
+
+    else:
+        raise ValueError(
+            f"Unsupported kinematics law: {law}"
+        )
+
+    if t <= 0.0:
+        return 0.0
+
+    if t >= 1.0:
+        return 1.0
+
+    return max(0.0, min(1.0, value))
+
+
+def choose_persona(
+    name: Optional[str] = None,
+) -> str:
+    """Select an archetype interactively or validate a CLI selection."""
+    names = list(personas.ARCHETYPE_NAMES)
+
+    if name:
+        if name == "random" or name in names:
+            return name
+
+        raise ValueError(
+            f"Unknown persona {name!r}. "
+            f"Available: {', '.join(names)}, random"
+        )
+
+    print("\nSelect a QA persona:")
+
+    for index, archetype in enumerate(names, 1):
+        law = KINEMATIC_LAWS.get(archetype, "linear")
+        print(
+            f"  {index}. {archetype} "
+            f"(kinematics: {law})"
+        )
+
+    print(f"  {len(names) + 1}. random")
+
+    while True:
+        raw = input(
+            f"Choose persona [1-{len(names) + 1}]: "
+        ).strip()
+
+        if raw.isdigit():
+            choice = int(raw)
+
+            if 1 <= choice <= len(names):
+                return names[choice - 1]
+
+            if choice == len(names) + 1:
+                return "random"
+
+        print("Invalid choice. Enter one of the listed numbers.")
+
+
+def make_persona(
+    archetype: str,
+    seed: Optional[int] = None,
+):
+    persona = personas.generate_persona(
+        seed=seed,
+        archetype=archetype,
+    )
+
+    print("\nSelected persona:")
+    print(f"  Name: {persona.name}")
+    print(f"  Archetype: {persona.archetype}")
+    print(f"  Seed: {persona.seed}")
+    print(
+        "  Kinematics law: "
+        f"{KINEMATIC_LAWS.get(persona.archetype, 'linear')}"
+    )
+    print(
+        f"  Swipe path mode: {persona.swipe_shape} "
+        "(sampled per gesture)"
+    )
+    print(f"  Text rate: {persona.wpm:.1f} WPM")
+    print(f"  Tremor scale: {persona.tremor_scale:.2f}")
+    print(f"  Dwell scale: {persona.dwell_scale:.2f}")
+    print(f"  Flick vigor: {persona.flick_vigor:.2f}")
+    print(f"  Recovery budget: {persona.retry_budget}")
+
+    return persona
+
+
+def type_text_with_maatouch(
+    driver: MaaTouchDriver,
+    u2_device: u2.Device,
+    text: str,
+    persona,
+    timing_scale: float = 1.0,
+    step_id: int = 0,
+) -> Dict[str, Any]:
+    """Type recorded text with a reproducible persona-specific QA schedule.
+
+    WPM determines the base interval. Burstiness introduces bounded timing
+    variation, and fatigue_rate gradually lengthens intervals across longer
+    text fields. The text content is not modified and no typos are injected.
+
+    This helper remains available for existing callers that explicitly use
+    timed character input. The TEXT_INPUT replay branch below uses
+    uiautomator2.send_keys for semantic text actions.
+    """
+    payload = str(text).replace(
+        "\r\n",
+        "\n",
+    ).replace("\r", "\n")
+
+    safe_wpm = max(
+        1.0,
+        float(getattr(persona, "wpm", 40.0)),
+    )
+    safe_scale = max(
+        0.1,
+        float(timing_scale),
+    )
+    base_interval = (12.0 / safe_wpm) * safe_scale
+
+    burstiness = max(
+        1.0,
+        float(getattr(persona, "burstiness", 1.0)),
+    )
+    fatigue_rate = max(
+        0.0,
+        min(
+            1.0,
+            float(getattr(persona, "fatigue_rate", 0.0)),
+        ),
+    )
+
+    variation = min(
+        0.30,
+        max(
+            0.0,
+            (burstiness - 1.0) * 0.18,
+        ),
+    )
+
+    schedule_seed = (
+        int(getattr(persona, "seed", 0))
+        + int(step_id) * 104729
+    )
+    rng = random.Random(schedule_seed)
+
+    intervals = []
+    denominator = max(1, len(payload) - 1)
+
+    for index, character in enumerate(payload):
+        factor = rng.uniform(
+            1.0 - variation,
+            1.0 + variation,
+        )
+
+        progress = index / denominator
+        factor *= 1.0 + (
+            0.25 * fatigue_rate * progress
+        )
+
+        if character == " ":
+            factor *= 1.12
+        elif character in ",;:":
+            factor *= 1.35
+        elif character in ".!?":
+            factor *= 1.65
+
+        intervals.append(
+            max(
+                0.015,
+                min(1.5, base_interval * factor),
+            )
+        )
+
+    process = getattr(driver, "proc", None)
+
+    maatouch_live = bool(
+        process is not None
+        and getattr(process, "poll", lambda: 1)() is None
+        and getattr(process, "stdin", None) is not None
+    )
+
+    input_method = (
+        "maatouch"
+        if maatouch_live
+        else "uiautomator2_timed_fallback"
+    )
+
+    completed_chars = 0
+    started_at = time.perf_counter()
+
+    for index, character in enumerate(payload):
+        try:
+            if character == "\n":
+                if maatouch_live:
+                    driver.press_key(66)
+                else:
+                    u2_device.press("enter")
+
+            elif maatouch_live:
+                driver.input_text(character)
+
+            else:
+                u2_device.send_keys(
+                    character,
+                    clear=False,
+                )
+
+            completed_chars += 1
+
+        except Exception as exc:
+            input_method = "uiautomator2_timed_fallback"
+            maatouch_live = False
+
+            try:
+                if character == "\n":
+                    u2_device.press("enter")
+                else:
+                    u2_device.send_keys(
+                        character,
+                        clear=False,
+                    )
+
+                completed_chars += 1
+
+            except Exception as fallback_exc:
+                return {
+                    "method": input_method,
+                    "configured_wpm": round(safe_wpm, 2),
+                    "burstiness": round(burstiness, 3),
+                    "fatigue_rate": round(fatigue_rate, 3),
+                    "schedule_seed": schedule_seed,
+                    "characters_requested": len(payload),
+                    "characters_submitted": completed_chars,
+                    "elapsed_seconds": round(
+                        time.perf_counter() - started_at,
+                        3,
+                    ),
+                    "error": (
+                        f"MaaTouch error: {exc}; "
+                        f"fallback error: {fallback_exc}"
+                    ),
+                }
+
+        if index < len(payload) - 1:
+            time.sleep(intervals[index])
+
+    elapsed = time.perf_counter() - started_at
+
+    mean_interval = (
+        sum(intervals[:-1])
+        / max(1, len(intervals) - 1)
+        if len(intervals) > 1
+        else 0.0
+    )
+
+    return {
+        "method": input_method,
+        "configured_wpm": round(safe_wpm, 2),
+        "burstiness": round(burstiness, 3),
+        "fatigue_rate": round(fatigue_rate, 3),
+        "schedule_seed": schedule_seed,
+        "characters_requested": len(payload),
+        "characters_submitted": completed_chars,
+        "mean_interval_seconds": round(mean_interval, 4),
+        "elapsed_seconds": round(elapsed, 3),
+    }
+
+
+# =====================================================================
+# 1. OEM POPUP & PERMISSION WATCHER
 # =====================================================================
 
 OEM_ALLOW_PATTERNS = [
-    "While using the app", "Only this time", "Allow", "ALLOW",
-    "Agree", "Continue", "Got it", "Install anyway"
+    "While using the app",
+    "Only this time",
+    "Allow",
+    "ALLOW",
+    "Agree",
+    "Continue",
+    "Got it",
+    "Install anyway",
 ]
 
 
-def dismiss_oem_system_dialogs(u2_dev: u2.Device) -> bool:
-    """
-    Automatically clicks Allow on system permission controllers or OEM security
-    dialogs if they intercept the foreground during replay.
-    """
+def dismiss_oem_system_dialogs(
+    u2_dev: u2.Device,
+) -> bool:
+    """Try to dismiss recognized system permission/security dialogs."""
     try:
-        curr = u2_dev.app_current().get("package", "")
+        current_package = (
+            u2_dev.app_current().get("package", "")
+        )
+
         if (
-            "permissioncontroller" in curr
-            or "securitycenter" in curr
-            or "packageinstaller" in curr
+            "permissioncontroller" in current_package
+            or "securitycenter" in current_package
+            or "packageinstaller" in current_package
         ):
             for label in OEM_ALLOW_PATTERNS:
-                btn = u2_dev(textContains=label)
-                if btn.exists:
-                    btn.click()
+                button = u2_dev(textContains=label)
+
+                if button.exists:
+                    button.click()
                     time.sleep(0.4)
                     return True
+
     except Exception:
         pass
+
     return False
 
 
@@ -57,196 +416,371 @@ class DeviceReplayWorker:
         self,
         serial: str,
         recording_path: Path,
-         parsed_data: Dict[str, Any],
+        parsed_data: Dict[str, Any],
         start_barrier: Optional[threading.Barrier] = None,
-        lockstep_barriers: Optional[List[threading.Barrier]] = None
+        lockstep_barriers: Optional[List[threading.Barrier]] = None,
+        persona=None,
+        profile_name: str = "baseline",
     ):
-        # Keep __init__ 100% lightweight (0ms blocking I/O on main thread)
         self.serial = serial
         self.recording_dir = recording_path.parent
         self.data = parsed_data
         self.start_barrier = start_barrier
         self.lockstep_barriers = lockstep_barriers
+
+        self.persona = persona or personas.generate_persona(
+            archetype="average"
+        )
+
+        self.kinematic_law = KINEMATIC_LAWS.get(
+            self.persona.archetype,
+            "linear",
+        )
+
+        if profile_name not in REPLAY_PROFILES:
+            raise ValueError(
+                f"Unknown timing profile: {profile_name}"
+            )
+
+        self.profile_name = profile_name
+        self.timing_scale = REPLAY_PROFILES[
+            profile_name
+        ]["timing_scale"]
+
         self.u2_dev: Optional[u2.Device] = None
         self.maatouch: Optional[MaaTouchDriver] = None
+        self._gesture_counter = 0
 
     def execute_test(self) -> Dict[str, Any]:
-        # 1. Connect uiautomator2 and MaaTouch in parallel
         self.u2_dev = u2.connect(self.serial)
+
         self.maatouch = MaaTouchDriver(self.serial)
         self.maatouch.start()
 
-        # 2. Force the device to the correct starting screen (Home or Target App)
         self._prepare_initial_state()
 
-        # 3. Wait at the starting line until ALL devices are connected and reset
         if self.start_barrier is not None:
             try:
                 self.start_barrier.wait(timeout=15.0)
             except threading.BrokenBarrierError:
-                print(f"[!] Start barrier timeout on {self.serial}, proceeding...")
+                print(
+                    f"[!] Start barrier timeout on {self.serial}, "
+                    "proceeding..."
+                )
 
         results = []
         steps = self.data["steps"]
-        last_swipe_trajectory: Optional[List[Dict[str, Any]]] = None
+        last_swipe_trajectory = None
 
         try:
-            for idx, step in enumerate(steps):
-                # Optional lockstep sync at the start of each step
-                if self.lockstep_barriers and idx < len(self.lockstep_barriers):
+            for index, step in enumerate(steps):
+                if (
+                    self.lockstep_barriers
+                    and index < len(self.lockstep_barriers)
+                ):
                     try:
-                        self.lockstep_barriers[idx].wait(timeout=12.0)
+                        self.lockstep_barriers[index].wait(
+                            timeout=12.0
+                        )
                     except threading.BrokenBarrierError:
                         pass
 
-                ev_type = step["event_type"]
+                event_type = step["event_type"]
 
-                if ev_type == "SWIPE" and idx > 0 and steps[idx - 1]["event_type"] == "SWIPE":
-                    next_tap = self._peek_next_tap_step(steps, idx)
-                    if next_tap and self._is_anchor_currently_visible(next_tap.get("anchor", {})):
+                if (
+                    event_type == "SWIPE"
+                    and index > 0
+                    and steps[index - 1]["event_type"] == "SWIPE"
+                ):
+                    next_tap = self._peek_next_tap_step(
+                        steps,
+                        index,
+                    )
+
+                    if (
+                        next_tap
+                        and self._is_anchor_currently_visible(
+                            next_tap.get("anchor", {})
+                        )
+                    ):
                         results.append({
                             "step_id": step["step_id"],
                             "type": "SWIPE",
-                            "status": "SKIPPED_TARGET_ALREADY_VISIBLE"
+                            "status": "SKIPPED_TARGET_ALREADY_VISIBLE",
                         })
                         continue
 
-                step_res = self._run_step(step, last_swipe_trajectory)
-                results.append(step_res)
+                step_result = self._run_step(
+                    step,
+                    last_swipe_trajectory,
+                )
+                results.append(step_result)
 
-                if ev_type == "SWIPE" and step.get("trajectory"):
+                if (
+                    event_type == "SWIPE"
+                    and step.get("trajectory")
+                ):
                     last_swipe_trajectory = step["trajectory"]
-                elif ev_type != "SWIPE":
+
+                elif event_type != "SWIPE":
                     last_swipe_trajectory = None
 
-                if step_res["status"] == "FAILED":
+                if step_result["status"] == "FAILED":
                     break
+
         finally:
             self.maatouch.stop()
 
         return {
             "serial": self.serial,
+            "persona": self.persona.name,
+            "persona_archetype": self.persona.archetype,
+            "persona_seed": self.persona.seed,
+            "kinematics_law": self.kinematic_law,
+            "swipe_path_family": self.persona.swipe_shape,
+            "text_input_wpm": round(self.persona.wpm, 2),
+            "tremor_scale": round(self.persona.tremor_scale, 3),
+            "dwell_scale": round(self.persona.dwell_scale, 3),
+            "flick_vigor": round(self.persona.flick_vigor, 3),
+            "retry_budget": self.persona.retry_budget,
+            "timing_profile": self.profile_name,
+            "timing_scale": self.timing_scale,
             "completed_steps": len(results),
-            "total_steps": self.data["total_steps"],
-            "steps": results
+            "total_steps": self.data.get(
+                "total_steps",
+                len(steps),
+            ),
+            "steps": results,
         }
 
     def _prepare_initial_state(self):
-        """Wakes device and resets to Home screen or target app before Step 1."""
-        print(f"[*] Resetting initial state for {self.serial}...")
+        """Wake the device and prepare its recorded starting state."""
+        print(
+            f"[*] Resetting initial state for {self.serial}..."
+        )
+
         try:
             self.u2_dev.screen_on()
+
             steps = self.data.get("steps", [])
             if not steps:
                 return
 
-            first_pkg = steps[0].get("pre_package", "")
-            
-            # Identify OEM launchers (Realme, Poco, Samsung, Pixel)
-            launcher_keywords = ["launcher", "miui.home", "sec.android.app", "nexuslauncher"]
-            is_home = not first_pkg or any(k in first_pkg.lower() for k in launcher_keywords)
-            
+            first_package = steps[0].get("pre_package", "")
+
+            launcher_keywords = [
+                "launcher",
+                "miui.home",
+                "sec.android.app",
+                "nexuslauncher",
+            ]
+
+            is_home = (
+                not first_package
+                or any(
+                    keyword in first_package.lower()
+                    for keyword in launcher_keywords
+                )
+            )
+
             if is_home:
-                # Press HOME twice to exit apps and reset to the default launcher page
                 self.u2_dev.press("home")
                 time.sleep(0.5)
                 self.u2_dev.press("home")
                 time.sleep(1.0)
-            else:
-                # If the recording started inside a specific app, launch it cleanly
-                self.u2_dev.app_start(first_pkg, stop=False)
-                time.sleep(2.0)
-        except Exception as e:
-            print(f"[!] Pre-flight state warning on {self.serial}: {e}")
 
-    def _peek_next_tap_step(self, steps: List[Dict[str, Any]], start_idx: int) -> Optional[Dict[str, Any]]:
-        """Finds the first TAP/LONG_PRESS step immediately following a chain of SWIPEs."""
-        for s in steps[start_idx + 1:]:
-            if s["event_type"] == "SWIPE":
+            else:
+                self.u2_dev.app_start(
+                    first_package,
+                    stop=False,
+                )
+                time.sleep(2.0)
+
+        except Exception as exc:
+            print(
+                f"[!] Pre-flight state warning on "
+                f"{self.serial}: {exc}"
+            )
+
+    def _peek_next_tap_step(
+        self,
+        steps: List[Dict[str, Any]],
+        start_idx: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Find the first tap/long-press after a swipe chain."""
+        for step in steps[start_idx + 1:]:
+            if step["event_type"] == "SWIPE":
                 continue
-            if s["event_type"] in ("TAP", "LONG_PRESS"):
-                return s
+
+            if step["event_type"] in ("TAP", "LONG_PRESS"):
+                return step
+
             break
+
         return None
 
-    def _is_anchor_currently_visible(self, anchor: Dict[str, Any]) -> bool:
+    def _is_anchor_currently_visible(
+        self,
+        anchor: Dict[str, Any],
+    ) -> bool:
         if not anchor:
             return False
-        if not (anchor.get("text") or anchor.get("content_desc") or anchor.get("resource_id")):
+
+        if not (
+            anchor.get("text")
+            or anchor.get("content_desc")
+            or anchor.get("resource_id")
+        ):
             return False
-        return self._find_bounds_in_hierarchy(anchor, (0.5, 0.5)) is not None
+
+        return (
+            self._find_bounds_in_hierarchy(
+                anchor,
+                (0.5, 0.5),
+            )
+            is not None
+        )
 
     def _run_step(
         self,
         step: Dict[str, Any],
-        prev_swipe_trajectory: Optional[List[Dict[str, Any]]] = None
+        prev_swipe_trajectory: Optional[
+            List[Dict[str, Any]]
+        ] = None,
     ) -> Dict[str, Any]:
         step_id = step["step_id"]
-        ev_type = step["event_type"]
+        event_type = step["event_type"]
 
-        # Respect human think-time (capped at 2.0s)
-        think_s = min(step.get("think_time_ms", 300) / 1000.0, 2.0)
-        if think_s > 0.05:
-            time.sleep(think_s)
+        think_seconds = min(
+            (
+                step.get("think_time_ms", 300) / 1000.0
+            ) * self.timing_scale,
+            2.0,
+        ) + max(
+            0.0,
+            self.persona.reaction_ms / 1000.0,
+        )
 
-        # 1. Hardware keys & Semantic Text
-        if ev_type == "KEY_EVENT":
+        if think_seconds > 0:
+            time.sleep(think_seconds)
+
+        if event_type == "KEY_EVENT":
             self.maatouch.press_key(int(step["keycode"]))
-            return {"step_id": step_id, "type": ev_type, "status": "PASSED"}
 
-        if ev_type == "TEXT_INPUT":
+            return {
+                "step_id": step_id,
+                "type": event_type,
+                "status": "PASSED",
+            }
+
+        if event_type == "TEXT_INPUT":
+            payload = step.get("text_payload", "")
+
+            if not isinstance(payload, str) or not payload:
+                return {
+                    "step_id": step_id,
+                    "type": event_type,
+                    "status": "FAILED",
+                    "reason": "TEXT_INPUT has no valid text_payload.",
+                }
+
             try:
-                self.u2_dev.send_keys(step["text_payload"], clear=False)
-            except Exception:
-                self.maatouch.input_text(step["text_payload"])
-            return {"step_id": step_id, "type": ev_type, "status": "PASSED"}
+                # Replay the recorded semantic text action. The relevant
+                # phone input field must already be focused.
+                self.u2_dev.send_keys(
+                    payload,
+                    clear=False,
+                )
+
+                return {
+                    "step_id": step_id,
+                    "type": event_type,
+                    "status": "PASSED",
+                    "text_input": {
+                        "method": "uiautomator2.send_keys",
+                        "characters": len(payload),
+                    },
+                }
+
+            except Exception as exc:
+                return {
+                    "step_id": step_id,
+                    "type": event_type,
+                    "status": "FAILED",
+                    "reason": f"Text injection failed: {exc}",
+                }
 
         trajectory = step.get("trajectory") or []
-        if not trajectory:
-            return {"step_id": step_id, "type": ev_type, "status": "SKIPPED"}
 
-        # 2. SWIPE: Always start from screen-normalized coordinates so swipes never
-        # snap to the top-left icon in an app drawer or RecyclerView.
-        if ev_type == "SWIPE":
-            w, h = self.maatouch.max_x, self.maatouch.max_y
+        if not trajectory:
+            return {
+                "step_id": step_id,
+                "type": event_type,
+                "status": "SKIPPED",
+            }
+
+        if event_type == "SWIPE":
+            width = self.maatouch.max_x
+            height = self.maatouch.max_y
+
             first = trajectory[0]
-            start_x = int(first["rx"] * w)
-            start_y = int(first["ry"] * h)
-            self._inject_scaled_trajectory(start_x, start_y, trajectory)
-            # Let fling momentum settle before the next step dumps the UI hierarchy
+            start_x = int(first["rx"] * width)
+            start_y = int(first["ry"] * height)
+
+            self._inject_scaled_trajectory(
+                start_x,
+                start_y,
+                trajectory,
+                gesture_type=event_type,
+            )
+
             time.sleep(0.55)
+
             return {
                 "step_id": step_id,
                 "type": "SWIPE",
                 "status": "PASSED",
                 "match_tier": "SCREEN_NORMALIZED_SWIPE",
-                "injected_start": (start_x, start_y)
+                "injected_start": (start_x, start_y),
             }
 
-        # 3. TAP / LONG_PRESS: Resolve semantic anchor (with auto-scroll recovery if preceded by SWIPE)
         anchor = step.get("anchor") or {}
+
         resolved_xy, match_tier = self._wait_and_resolve_target(
             anchor,
             trajectory[0],
             timeout_s=6.0,
-            scroll_recovery_trajectory=prev_swipe_trajectory
+            scroll_recovery_trajectory=prev_swipe_trajectory,
         )
+
         if resolved_xy is None:
             return {
                 "step_id": step_id,
-                "type": ev_type,
+                "type": event_type,
                 "status": "FAILED",
-                "reason": f"Could not resolve anchor: text='{anchor.get('text')}' desc='{anchor.get('content_desc')}' id='{anchor.get('resource_id')}'"
+                "reason": (
+                    f"Could not resolve anchor: "
+                    f"text='{anchor.get('text')}' "
+                    f"desc='{anchor.get('content_desc')}' "
+                    f"id='{anchor.get('resource_id')}'"
+                ),
             }
 
         start_x, start_y = resolved_xy
-        self._inject_scaled_trajectory(start_x, start_y, trajectory)
+
+        self._inject_scaled_trajectory(
+            start_x,
+            start_y,
+            trajectory,
+            gesture_type=event_type,
+        )
+
         return {
             "step_id": step_id,
-            "type": ev_type,
+            "type": event_type,
             "status": "PASSED",
             "match_tier": match_tier,
-            "injected_start": (start_x, start_y)
+            "injected_start": (start_x, start_y),
         }
 
     # -----------------------------------------------------------------
@@ -258,46 +792,86 @@ class DeviceReplayWorker:
         anchor: Dict[str, Any],
         first_sample: Dict[str, Any],
         timeout_s: float = 6.0,
-        scroll_recovery_trajectory: Optional[List[Dict[str, Any]]] = None
+        scroll_recovery_trajectory: Optional[
+            List[Dict[str, Any]]
+        ] = None,
     ) -> Tuple[Optional[Tuple[int, int]], str]:
         deadline = time.perf_counter() + timeout_s
+
         has_semantic_id = bool(
-            anchor.get("resource_id") or anchor.get("text") or anchor.get("content_desc")
+            anchor.get("resource_id")
+            or anchor.get("text")
+            or anchor.get("content_desc")
         )
-        expected_norm_xy = (first_sample.get("rx", 0.5), first_sample.get("ry", 0.5))
-        extra_scrolls_left = 5 if scroll_recovery_trajectory else 0
+
+        expected_norm_xy = (
+            first_sample.get("rx", 0.5),
+            first_sample.get("ry", 0.5),
+        )
+
+        extra_scrolls_left = (
+            min(5, self.persona.retry_budget)
+            if scroll_recovery_trajectory
+            else 0
+        )
 
         while time.perf_counter() < deadline:
             dismiss_oem_system_dialogs(self.u2_dev)
 
-            # TIER 1: Match UI Hierarchy Node
             if has_semantic_id:
-                bounds = self._find_bounds_in_hierarchy(anchor, expected_norm_xy)
+                bounds = self._find_bounds_in_hierarchy(
+                    anchor,
+                    expected_norm_xy,
+                )
+
                 if bounds:
-                    l, t, r, b = bounds
+                    left, top, right, bottom = bounds
+
                     rx = anchor.get("element_rx", 0.5)
                     ry = anchor.get("element_ry", 0.5)
-                    hit_x = int(l + rx * max(1, (r - l)))
-                    hit_y = int(t + ry * max(1, (b - t)))
-                    return (hit_x, hit_y), "TIER1_UI_ANCHOR"
 
-            # TIER 2: Multi-Scale Visual Crop Match
-            crop_rel = anchor.get("visual_crop_path")
-            if crop_rel:
-                crop_full = self.recording_dir / crop_rel
+                    hit_x = int(
+                        left + rx * max(1, right - left)
+                    )
+                    hit_y = int(
+                        top + ry * max(1, bottom - top)
+                    )
+
+                    return (
+                        hit_x,
+                        hit_y,
+                    ), "TIER1_UI_ANCHOR"
+
+            crop_relative = anchor.get("visual_crop_path")
+
+            if crop_relative:
+                crop_full = self.recording_dir / crop_relative
+
                 if crop_full.exists():
-                    vis_hit = self._match_template_multiscale(crop_full)
-                    if vis_hit:
-                        return vis_hit, "TIER2_VISUAL_TEMPLATE"
+                    visual_hit = self._match_template_multiscale(
+                        crop_full
+                    )
 
-            # If preceded by a SWIPE and target still isn't visible, repeat the scroll swipe
-            if extra_scrolls_left > 0 and scroll_recovery_trajectory:
+                    if visual_hit:
+                        return visual_hit, "TIER2_VISUAL_TEMPLATE"
+
+            if (
+                extra_scrolls_left > 0
+                and scroll_recovery_trajectory
+            ):
                 extra_scrolls_left -= 1
-                w, h = self.maatouch.max_x, self.maatouch.max_y
-                s0 = scroll_recovery_trajectory[0]
+
+                width = self.maatouch.max_x
+                height = self.maatouch.max_y
+                first_point = scroll_recovery_trajectory[0]
+
                 self._inject_scaled_trajectory(
-                    int(s0["rx"] * w), int(s0["ry"] * h), scroll_recovery_trajectory
+                    int(first_point["rx"] * width),
+                    int(first_point["ry"] * height),
+                    scroll_recovery_trajectory,
+                    gesture_type="SWIPE",
                 )
+
                 deadline += 1.4
                 time.sleep(0.55)
                 continue
@@ -307,145 +881,913 @@ class DeviceReplayWorker:
 
             time.sleep(0.4)
 
-        # If a specific label (like "Play Store") was required and never found, fail cleanly
         if anchor.get("text") or anchor.get("content_desc"):
             return None, "NOT_FOUND"
 
-        # TIER 3: Screen-Normalized Coordinate Fallback (for unlabeled views)
-        w, h = self.maatouch.max_x, self.maatouch.max_y
-        fallback_x = int(first_sample["rx"] * w)
-        fallback_y = int(first_sample["ry"] * h)
-        return (fallback_x, fallback_y), "TIER3_NORMALIZED_XY"
+        width = self.maatouch.max_x
+        height = self.maatouch.max_y
+
+        fallback_x = int(first_sample["rx"] * width)
+        fallback_y = int(first_sample["ry"] * height)
+
+        return (
+            fallback_x,
+            fallback_y,
+        ), "TIER3_NORMALIZED_XY"
 
     def _find_bounds_in_hierarchy(
         self,
         anchor: Dict[str, Any],
-        expected_norm_xy: Tuple[float, float]
+        expected_norm_xy: Tuple[float, float],
     ) -> Optional[Tuple[int, int, int, int]]:
         try:
-            xml_str = self.u2_dev.dump_hierarchy(compressed=False)
-            root = ET.fromstring(xml_str.encode("utf-8"))
+            xml_string = self.u2_dev.dump_hierarchy(
+                compressed=False
+            )
+            root = ET.fromstring(xml_string.encode("utf-8"))
+
         except Exception:
             return None
 
         target_rid = anchor.get("resource_id", "").strip()
-        target_txt = anchor.get("text", "").strip()
+        target_text = anchor.get("text", "").strip()
         target_desc = anchor.get("content_desc", "").strip()
-        target_cls = anchor.get("class_name", "").strip()
+        target_class = anchor.get("class_name", "").strip()
 
-        w_screen = max(1, self.maatouch.max_x)
-        h_screen = max(1, self.maatouch.max_y)
-        exp_rx, exp_ry = expected_norm_xy
+        screen_width = max(1, self.maatouch.max_x)
+        screen_height = max(1, self.maatouch.max_y)
+
+        expected_x, expected_y = expected_norm_xy
 
         best_bounds = None
         best_score = -1.0
 
-        for elem in root.iter("node"):
-            rid = elem.attrib.get("resource-id", "").strip()
-            txt = elem.attrib.get("text", "").strip()
-            desc = elem.attrib.get("content-desc", "").strip()
-            cls = elem.attrib.get("class", "").strip()
+        for element in root.iter("node"):
+            resource_id = element.attrib.get(
+                "resource-id",
+                "",
+            ).strip()
 
-            # Hard Guard: If the recorded element had text or content-desc (e.g., "Play Store"),
-            # do not match another icon just because it shares the generic launcher resource-id!
-            if target_txt and txt.lower() != target_txt.lower() and desc.lower() != target_txt.lower():
+            text = element.attrib.get("text", "").strip()
+            description = element.attrib.get(
+                "content-desc",
+                "",
+            ).strip()
+
+            class_name = element.attrib.get(
+                "class",
+                "",
+            ).strip()
+
+            if (
+                target_text
+                and text.lower() != target_text.lower()
+                and description.lower() != target_text.lower()
+            ):
                 continue
-            if target_desc and desc.lower() != target_desc.lower() and txt.lower() != target_desc.lower():
+
+            if (
+                target_desc
+                and description.lower() != target_desc.lower()
+                and text.lower() != target_desc.lower()
+            ):
                 continue
 
             score = 0.0
-            if target_txt and (txt.lower() == target_txt.lower() or desc.lower() == target_txt.lower()):
-                score += 10.0
-            if target_desc and (desc.lower() == target_desc.lower() or txt.lower() == target_desc.lower()):
+
+            if target_text and (
+                text.lower() == target_text.lower()
+                or description.lower() == target_text.lower()
+            ):
                 score += 10.0
 
-            if target_rid and rid == target_rid:
+            if target_desc and (
+                description.lower() == target_desc.lower()
+                or text.lower() == target_desc.lower()
+            ):
+                score += 10.0
+
+            if target_rid and resource_id == target_rid:
                 score += 5.0
-            elif target_rid and rid.split("/")[-1] == target_rid.split("/")[-1]:
+
+            elif (
+                target_rid
+                and resource_id.split("/")[-1]
+                == target_rid.split("/")[-1]
+            ):
                 score += 4.0
 
-            if target_cls and cls == target_cls:
+            if target_class and class_name == target_class:
                 score += 1.0
 
             if score < 4.0:
                 continue
 
-            bounds_str = elem.attrib.get("bounds", "")
-            if not bounds_str:
-                continue
-            parts = bounds_str.replace("][", ",").strip("[]").split(",")
-            l, t, r, b = map(int, parts)
-            if r <= l or b <= t:
+            bounds_string = element.attrib.get("bounds", "")
+
+            if not bounds_string:
                 continue
 
-            # Tie-breaker: Spatial proximity to recorded normalized (rx, ry)
-            cx_norm = ((l + r) * 0.5) / w_screen
-            cy_norm = ((t + b) * 0.5) / h_screen
-            dist = math.hypot(cx_norm - exp_rx, cy_norm - exp_ry)
-            proximity_bonus = max(0.0, 1.0 - dist)  # 0.0 to 1.0
+            parts = (
+                bounds_string
+                .replace("][", ",")
+                .strip("[]")
+                .split(",")
+            )
 
+            try:
+                left, top, right, bottom = map(int, parts)
+            except ValueError:
+                continue
+
+            if right <= left or bottom <= top:
+                continue
+
+            center_x_norm = (
+                (left + right) * 0.5
+            ) / screen_width
+
+            center_y_norm = (
+                (top + bottom) * 0.5
+            ) / screen_height
+
+            distance = math.hypot(
+                center_x_norm - expected_x,
+                center_y_norm - expected_y,
+            )
+
+            proximity_bonus = max(0.0, 1.0 - distance)
             total_score = score + proximity_bonus
+
             if total_score > best_score:
                 best_score = total_score
-                best_bounds = (l, t, r, b)
+                best_bounds = (
+                    left,
+                    top,
+                    right,
+                    bottom,
+                )
 
         return best_bounds
 
-    def _match_template_multiscale(self, crop_path: Path, threshold: float = 0.80) -> Optional[Tuple[int, int]]:
+    def _match_template_multiscale(
+        self,
+        crop_path: Path,
+        threshold: float = 0.80,
+    ) -> Optional[Tuple[int, int]]:
         try:
-            screen_bgr = self.u2_dev.screenshot(format="opencv")
+            screen_bgr = self.u2_dev.screenshot(
+                format="opencv"
+            )
             template = cv2.imread(str(crop_path))
+
             if screen_bgr is None or template is None:
                 return None
 
-            gray_screen = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2GRAY)
-            gray_tmpl = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-            th, tw = gray_tmpl.shape[:2]
+            gray_screen = cv2.cvtColor(
+                screen_bgr,
+                cv2.COLOR_BGR2GRAY,
+            )
 
-            best_val = -1.0
+            gray_template = cv2.cvtColor(
+                template,
+                cv2.COLOR_BGR2GRAY,
+            )
+
+            template_height, template_width = (
+                gray_template.shape[:2]
+            )
+
+            best_value = -1.0
             best_center = None
 
             for scale in np.linspace(0.8, 1.2, 5):
-                rw, rh = int(tw * scale), int(th * scale)
-                if rw >= gray_screen.shape[1] or rh >= gray_screen.shape[0] or rw < 12 or rh < 12:
-                    continue
-                resized = cv2.resize(gray_tmpl, (rw, rh))
-                res = cv2.matchTemplate(gray_screen, resized, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                if max_val > best_val:
-                    best_val = max_val
-                    best_center = (max_loc[0] + rw // 2, max_loc[1] + rh // 2)
+                resized_width = int(template_width * scale)
+                resized_height = int(template_height * scale)
 
-            if best_val >= threshold and best_center:
+                if (
+                    resized_width >= gray_screen.shape[1]
+                    or resized_height >= gray_screen.shape[0]
+                    or resized_width < 12
+                    or resized_height < 12
+                ):
+                    continue
+
+                resized = cv2.resize(
+                    gray_template,
+                    (resized_width, resized_height),
+                )
+
+                result = cv2.matchTemplate(
+                    gray_screen,
+                    resized,
+                    cv2.TM_CCOEFF_NORMED,
+                )
+
+                _, max_value, _, max_location = (
+                    cv2.minMaxLoc(result)
+                )
+
+                if max_value > best_value:
+                    best_value = max_value
+                    best_center = (
+                        max_location[0] + resized_width // 2,
+                        max_location[1] + resized_height // 2,
+                    )
+
+            if best_value >= threshold and best_center:
                 return best_center
+
         except Exception:
             pass
+
         return None
 
     # -----------------------------------------------------------------
     # HIGH-FREQUENCY MAATOUCH TRAJECTORY INJECTION
     # -----------------------------------------------------------------
 
-    def _inject_scaled_trajectory(self, start_x: int, start_y: int, trajectory: List[Dict[str, Any]]):
-        w, h = self.maatouch.max_x, self.maatouch.max_y
+    def _send_maatouch_batch(
+        self,
+        commands: List[str],
+    ) -> bool:
+        """Send a scheduled command batch through the active MaaTouch pipe."""
+        driver = self.maatouch
+        sender = getattr(driver, "_send", None)
+        process = getattr(driver, "proc", None)
+
+        if not callable(sender) or process is None:
+            return False
+
+        try:
+            poll = getattr(process, "poll", None)
+
+            if callable(poll) and poll() is not None:
+                return False
+
+            sender("\n".join(commands) + "\n")
+            return True
+
+        except Exception as exc:
+            print(
+                f"[!] MaaTouch batch failed on {self.serial}: {exc}"
+            )
+
+            try:
+                driver.touch_up(0)
+            except Exception:
+                pass
+
+            return False
+
+    def _inject_scaled_trajectory(
+        self,
+        start_x: int,
+        start_y: int,
+        trajectory: List[Dict[str, Any]],
+        gesture_type: str = "SWIPE",
+    ):
+        """Generate a persona-conditioned QA gesture and send it via MaaTouch.
+
+        Persona traits affect the bounded duration, path geometry, and device
+        pressure value. Recorded start/end targets are retained. Drags keep
+        their recorded intermediate geometry because a drag may operate a
+        slider, draw, or reorder an object.
+        """
+        gesture_type = str(
+            gesture_type or "SWIPE"
+        ).upper()
+
+        if not trajectory:
+            return
+
+        width = max(1, int(self.maatouch.max_x))
+        height = max(1, int(self.maatouch.max_y))
+
+        start_x = max(
+            0,
+            min(width, int(start_x)),
+        )
+        start_y = max(
+            0,
+            min(height, int(start_y)),
+        )
+
         first = trajectory[0]
-        self.maatouch.touch_down(0, start_x, start_y, first.get("pressure", 50))
-
-        t0 = time.perf_counter()
-        for sample in trajectory[1:-1]:
-            target_elapsed_s = sample["t_offset_ms"] / 1000.0
-            sleep_s = target_elapsed_s - (time.perf_counter() - t0)
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-
-            cur_x = max(0, min(w, int(start_x + sample["dx_norm"] * w)))
-            cur_y = max(0, min(h, int(start_y + sample["dy_norm"] * h)))
-            self.maatouch.touch_move(0, cur_x, cur_y, sample.get("pressure", 50))
-
         last = trajectory[-1]
-        final_sleep = (last["t_offset_ms"] / 1000.0) - (time.perf_counter() - t0)
-        if final_sleep > 0:
-            time.sleep(final_sleep)
+
+        first_ms = float(
+            first.get("t_offset_ms", 0.0)
+        )
+        last_ms = float(
+            last.get("t_offset_ms", first_ms + 1.0)
+        )
+        recorded_duration_ms = max(
+            1.0,
+            last_ms - first_ms,
+        )
+
+        source_resolution = self.data.get(
+            "source_resolution",
+            {},
+        )
+
+        source_width = max(
+            1.0,
+            float(source_resolution.get("width") or width),
+        )
+        source_height = max(
+            1.0,
+            float(source_resolution.get("height") or height),
+        )
+
+        if (
+            all(key in first for key in ("x", "y"))
+            and all(key in last for key in ("x", "y"))
+        ):
+            end_x = int(round(
+                start_x
+                + (
+                    float(last["x"]) - float(first["x"])
+                ) * width / source_width
+            ))
+
+            end_y = int(round(
+                start_y
+                + (
+                    float(last["y"]) - float(first["y"])
+                ) * height / source_height
+            ))
+
+        else:
+            end_x = int(round(
+                start_x
+                + float(last.get("dx_norm", 0.0)) * width
+            ))
+
+            end_y = int(round(
+                start_y
+                + float(last.get("dy_norm", 0.0)) * height
+            ))
+
+        end_x = max(0, min(width, end_x))
+        end_y = max(0, min(height, end_y))
+
+        # One reproducible random stream per gesture.
+        self._gesture_counter += 1
+        gesture_seed = (
+            int(self.persona.seed)
+            + self._gesture_counter * 104729
+        )
+
+        rng = random.Random(gesture_seed)
+        motion = self.persona.swipe_profile
+
+        # Normalize persona-specific pressure to the MaaTouch pressure range.
+        # This is an injected digitizer value, not calibrated physical force.
+        max_pressure = max(
+            1,
+            int(getattr(self.maatouch, "max_pressure", 255)),
+        )
+
+        low_pressure, typical_pressure, high_pressure = (
+            motion["pressure_ratio"]
+        )
+
+        pressure_ratio = rng.triangular(
+            float(low_pressure),
+            float(high_pressure),
+            float(typical_pressure),
+        )
+
+        pressure_peak = max(
+            1,
+            min(
+                max_pressure,
+                int(round(max_pressure * pressure_ratio)),
+            ),
+        )
+
+        pressure_ripple = float(motion["pressure_ripple"])
+        pressure_envelope = float(motion["pressure_envelope"])
+        pressure_state = 0.0
+
+        def pressure_at(
+            progress: float,
+            update_state: bool = False,
+        ) -> int:
+            """Compute bounded pressure for the current contact."""
+            nonlocal pressure_state
+
+            u = max(
+                0.0,
+                min(1.0, float(progress)),
+            )
+
+            if update_state:
+                pressure_state = (
+                    0.64 * pressure_state
+                    + rng.gauss(0.0, 0.46)
+                )
+                pressure_state = max(
+                    -1.4,
+                    min(1.4, pressure_state),
+                )
+
+            envelope = (
+                math.sin(math.pi * u) ** 0.75
+                if 0.0 < u < 1.0
+                else 0.0
+            )
+
+            level = (
+                1.0
+                - pressure_envelope * (1.0 - envelope)
+            )
+            level *= 1.0 + pressure_ripple * pressure_state
+
+            value = int(round(pressure_peak * level))
+
+            return max(
+                1,
+                min(max_pressure, value),
+            )
+
+        initial_pressure = pressure_at(0.0)
+
+        # Taps and long presses remain stationary.
+        if gesture_type in ("TAP", "LONG_PRESS"):
+            duration_scale = max(
+                0.25,
+                float(self.persona.dwell_scale),
+            )
+
+            duration_ms = max(
+                1,
+                int(
+                    recorded_duration_ms
+                    * duration_scale
+                    * self.timing_scale
+                ),
+            )
+
+            pressure = pressure_at(0.5)
+
+            commands = [
+                f"d 0 {start_x} {start_y} {pressure}",
+                "c",
+                f"w {duration_ms}",
+                "u 0",
+                "c",
+            ]
+
+            if self._send_maatouch_batch(commands):
+                return
+
+            self.maatouch.touch_down(
+                0,
+                start_x,
+                start_y,
+                pressure,
+            )
+
+            time.sleep(duration_ms / 1000.0)
+            self.maatouch.touch_up(0)
+            return
+
+        # Apply the persona's movement vigor, then clamp it to its configured
+        # duration range. A modest random factor varies consecutive gestures.
+        vigor = max(
+            0.55,
+            float(self.persona.flick_vigor),
+        )
+
+        dwell_adjustment = (
+            0.95
+            + 0.05 * float(self.persona.dwell_scale)
+        )
+
+        duration_scale = (
+            (1.0 / vigor)
+            * dwell_adjustment
+            * rng.triangular(0.94, 1.08, 1.0)
+        )
+
+        duration_min, duration_max = (
+            motion["duration_scale_bounds"]
+        )
+
+        duration_scale = max(
+            float(duration_min),
+            min(float(duration_max), duration_scale),
+        )
+
+        duration_ms = max(
+            35,
+            int(round(
+                recorded_duration_ms
+                * duration_scale
+                * self.timing_scale
+            )),
+        )
+
+        duration_ms = min(2500, duration_ms)
+
+        point_count = max(
+            3,
+            int(round(
+                duration_ms * TARGET_TOUCH_RATE_HZ / 1000.0
+            )) + 1,
+        )
+        point_count = min(120, point_count)
+
+        delta_x = float(end_x - start_x)
+        delta_y = float(end_y - start_y)
+        distance = math.hypot(delta_x, delta_y)
+
+        if distance > 1e-6:
+            normal_x = -delta_y / distance
+            normal_y = delta_x / distance
+        else:
+            normal_x = 0.0
+            normal_y = 0.0
+
+        moves = []
+
+        if gesture_type == "DRAG":
+            # Preserve the recorded drag geometry. Only duration and pressure
+            # vary, so the test's intended slider/object destination is retained.
+            for point in trajectory[1:]:
+                raw_time = float(
+                    point.get("t_offset_ms", first_ms)
+                )
+
+                time_progress = max(
+                    0.0,
+                    min(
+                        1.0,
+                        (raw_time - first_ms)
+                        / recorded_duration_ms,
+                    ),
+                )
+
+                elapsed_ms = int(round(
+                    duration_ms * time_progress
+                ))
+
+                if (
+                    all(key in point for key in ("x", "y"))
+                    and all(key in first for key in ("x", "y"))
+                ):
+                    x = (
+                        start_x
+                        + (
+                            float(point["x"])
+                            - float(first["x"])
+                        ) * width / source_width
+                    )
+
+                    y = (
+                        start_y
+                        + (
+                            float(point["y"])
+                            - float(first["y"])
+                        ) * height / source_height
+                    )
+
+                else:
+                    x = (
+                        start_x
+                        + float(point.get("dx_norm", 0.0)) * width
+                    )
+
+                    y = (
+                        start_y
+                        + float(point.get("dy_norm", 0.0)) * height
+                    )
+
+                x = max(0, min(width, int(round(x))))
+                y = max(0, min(height, int(round(y))))
+
+                pressure = pressure_at(
+                    time_progress,
+                    update_state=True,
+                )
+
+                moves.append((
+                    elapsed_ms,
+                    x,
+                    y,
+                    pressure,
+                ))
+
+            if (
+                not moves
+                or moves[-1][1:3] != (end_x, end_y)
+            ):
+                moves.append((
+                    duration_ms,
+                    end_x,
+                    end_y,
+                    pressure_at(1.0),
+                ))
+            else:
+                moves[-1] = (
+                    duration_ms,
+                    end_x,
+                    end_y,
+                    pressure_at(1.0),
+                )
+
+        else:
+            # ---------------------------------------------------------
+            # PER-GESTURE SWIPE PATH
+            # ---------------------------------------------------------
+            ratio_low, ratio_typical, ratio_high = (
+                motion["lateral_ratio"]
+            )
+
+            lateral_ratio = rng.triangular(
+                float(ratio_low),
+                float(ratio_high),
+                float(ratio_typical),
+            )
+
+            shape_weights = motion["shape_weights"]
+            shape_names = list(shape_weights)
+
+            shape_mode = rng.choices(
+                shape_names,
+                weights=[
+                    float(shape_weights[name])
+                    for name in shape_names
+                ],
+                k=1,
+            )[0]
+
+            if shape_mode == "near_line":
+                lateral_ratio *= rng.uniform(0.20, 0.48)
+
+            elif shape_mode == "shallow_s":
+                lateral_ratio *= rng.uniform(0.72, 1.00)
+
+            elif shape_mode == "wander":
+                lateral_ratio *= rng.uniform(0.82, 1.04)
+
+            amplitude = min(
+                distance * lateral_ratio,
+                min(width, height) * 0.085,
+            )
+
+            preferred_direction = (
+                -1.0
+                if float(self.persona.curve_bias) < 0
+                else 1.0
+            )
+
+            curve_direction = (
+                preferred_direction
+                if rng.random() < 0.55
+                else -preferred_direction
+            )
+
+            # Generate a smooth, correlated path rather than independent
+            # coordinate noise. The geometry changes each gesture.
+            knot_count = rng.randint(4, 7)
+            knot_values = [0.0]
+            state = 0.0
+
+            for knot_index in range(1, knot_count - 1):
+                state = (
+                    0.58 * state
+                    + rng.gauss(0.0, 1.0)
+                )
+
+                knot_progress = (
+                    knot_index / (knot_count - 1)
+                )
+
+                if shape_mode == "single_bend":
+                    base = math.sin(
+                        math.pi * knot_progress
+                    )
+
+                elif shape_mode == "shallow_s":
+                    base = 0.62 * math.sin(
+                        2.0 * math.pi * knot_progress
+                    )
+
+                elif shape_mode == "near_line":
+                    base = 0.22 * math.sin(
+                        math.pi * knot_progress
+                    )
+
+                else:
+                    base = 0.0
+
+                noise_strength = (
+                    float(motion["roughness"]) * 0.42
+                )
+
+                knot_values.append(
+                    curve_direction * base
+                    + state * noise_strength
+                )
+
+            knot_values.append(0.0)
+
+            peak = max(
+                (abs(value) for value in knot_values),
+                default=0.0,
+            )
+
+            if peak > 1e-9:
+                knot_values = [
+                    value / peak
+                    for value in knot_values
+                ]
+
+            def path_offset(progress: float) -> float:
+                u = max(
+                    0.0,
+                    min(1.0, float(progress)),
+                )
+
+                if (
+                    u <= 0.0
+                    or u >= 1.0
+                    or amplitude <= 0.0
+                ):
+                    return 0.0
+
+                scaled = u * (len(knot_values) - 1)
+                left = min(
+                    len(knot_values) - 2,
+                    int(scaled),
+                )
+                local = scaled - left
+
+                p0 = knot_values[max(0, left - 1)]
+                p1 = knot_values[left]
+                p2 = knot_values[left + 1]
+                p3 = knot_values[
+                    min(len(knot_values) - 1, left + 2)
+                ]
+
+                tangent1 = 0.5 * (p2 - p0)
+                tangent2 = 0.5 * (p3 - p1)
+
+                local2 = local * local
+                local3 = local2 * local
+
+                h00 = (
+                    2.0 * local3
+                    - 3.0 * local2
+                    + 1.0
+                )
+                h10 = (
+                    local3
+                    - 2.0 * local2
+                    + local
+                )
+                h01 = (
+                    -2.0 * local3
+                    + 3.0 * local2
+                )
+                h11 = local3 - local2
+
+                value = (
+                    h00 * p1
+                    + h10 * tangent1
+                    + h01 * p2
+                    + h11 * tangent2
+                )
+
+                endpoint_fade = (
+                    math.sin(math.pi * u) ** 0.75
+                )
+
+                return amplitude * value * endpoint_fade
+
+            # Use a consistent acceleration character for each persona.
+            # Path geometry remains independently sampled for each gesture.
+            speed_curve = self.kinematic_law
+            pressure_state = 0.0
+
+            for index in range(1, point_count):
+                time_progress = (
+                    index / (point_count - 1)
+                )
+
+                path_progress = apply_kinematic_law(
+                    time_progress,
+                    speed_curve,
+                )
+
+                x = (
+                    start_x
+                    + delta_x * path_progress
+                )
+
+                y = (
+                    start_y
+                    + delta_y * path_progress
+                )
+
+                offset = path_offset(path_progress)
+
+                x += normal_x * offset
+                y += normal_y * offset
+
+                if index == point_count - 1:
+                    x = float(end_x)
+                    y = float(end_y)
+
+                x = max(
+                    0,
+                    min(width, int(round(x))),
+                )
+                y = max(
+                    0,
+                    min(height, int(round(y))),
+                )
+
+                elapsed_ms = int(round(
+                    duration_ms * time_progress
+                ))
+
+                pressure = pressure_at(
+                    time_progress,
+                    update_state=True,
+                )
+
+                moves.append((
+                    elapsed_ms,
+                    x,
+                    y,
+                    pressure,
+                ))
+
+        # -------------------------------------------------------------
+        # SEND THE COMPLETE GESTURE TO MAATOUCH
+        # -------------------------------------------------------------
+        commands = [
+            f"d 0 {start_x} {start_y} {initial_pressure}",
+            "c",
+        ]
+
+        previous_elapsed = 0
+
+        for elapsed_ms, x, y, pressure in moves:
+            wait_ms = max(
+                0,
+                int(elapsed_ms) - previous_elapsed,
+            )
+
+            if wait_ms:
+                commands.append(f"w {wait_ms}")
+
+            commands.extend([
+                f"m 0 {x} {y} {pressure}",
+                "c",
+            ])
+
+            previous_elapsed = int(elapsed_ms)
+
+        commands.extend([
+            "u 0",
+            "c",
+        ])
+
+        if self._send_maatouch_batch(commands):
+            return
+
+        # Fallback for a driver without a usable MaaTouch pipe.
+        self.maatouch.touch_down(
+            0,
+            start_x,
+            start_y,
+            initial_pressure,
+        )
+
+        started_at = time.perf_counter()
+
+        for elapsed_ms, x, y, pressure in moves:
+            remaining = (
+                elapsed_ms / 1000.0
+                - (time.perf_counter() - started_at)
+            )
+
+            if remaining > 0:
+                time.sleep(remaining)
+
+            self.maatouch.touch_move(
+                0,
+                x,
+                y,
+                pressure,
+            )
+
         self.maatouch.touch_up(0)
 
 
@@ -453,48 +1795,160 @@ class DeviceReplayWorker:
 # 3. PARALLEL MULTI-DEVICE FLEET RUNNER
 # =====================================================================
 
-def run_fleet_replay(recording_json_path: str, target_serials: List[str], lockstep: bool = True):
+def run_fleet_replay(
+    recording_json_path: str,
+    target_serials: List[str],
+    persona,
+    lockstep: bool = True,
+    profile_name: str = "baseline",
+):
     rec_path = Path(recording_json_path)
-    parsed_data = json.loads(rec_path.read_text(encoding="utf-8"))
-    num_devices = len(target_serials)
-    num_steps = len(parsed_data.get("steps", []))
 
-    print(f"[*] Starting synchronized parallel replay of {rec_path.name} across {num_devices} devices...")
+    parsed_data = json.loads(
+        rec_path.read_text(encoding="utf-8")
+    )
 
-    # Barrier 1: Ensures all devices finish u2.connect() + maatouch.start() before Step 1 begins
-    start_barrier = threading.Barrier(num_devices)
+    if not target_serials:
+        raise ValueError(
+            "Provide at least one target device serial."
+        )
 
-    # Barrier 2 (Lockstep): Keeps all devices aligned at the start of every step
+    if profile_name not in REPLAY_PROFILES:
+        raise ValueError(
+            f"Unknown timing profile: {profile_name}"
+        )
+
+    number_of_devices = len(target_serials)
+    number_of_steps = len(parsed_data.get("steps", []))
+
+    print(
+        "[*] Starting synchronized parallel replay of "
+        f"{rec_path.name} across {number_of_devices} devices..."
+    )
+
+    print(
+        f"[*] Persona={persona.name} ({persona.archetype}), "
+        f"seed={persona.seed}, "
+        f"law={KINEMATIC_LAWS.get(persona.archetype, 'linear')}, "
+        f"text={persona.wpm:.1f} WPM, "
+        f"timing={profile_name}."
+    )
+
+    start_barrier = threading.Barrier(number_of_devices)
+
     lockstep_barriers = (
-        [threading.Barrier(num_devices) for _ in range(num_steps)]
-        if lockstep and num_devices > 1 else None
+        [
+            threading.Barrier(number_of_devices)
+            for _ in range(number_of_steps)
+        ]
+        if lockstep and number_of_devices > 1
+        else None
     )
 
     workers = [
         DeviceReplayWorker(
-            serial=s,
+            serial=serial,
             recording_path=rec_path,
             parsed_data=parsed_data,
             start_barrier=start_barrier,
-            lockstep_barriers=lockstep_barriers
+            lockstep_barriers=lockstep_barriers,
+            persona=persona,
+            profile_name=profile_name,
         )
-        for s in target_serials
+        for serial in target_serials
     ]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_devices) as pool:
-        futures = {pool.submit(w.execute_test): w.serial for w in workers}
-        for fut in concurrent.futures.as_completed(futures):
-            serial = futures[fut]
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=number_of_devices
+    ) as pool:
+        futures = {
+            pool.submit(worker.execute_test): worker.serial
+            for worker in workers
+        }
+
+        for future in concurrent.futures.as_completed(futures):
+            serial = futures[future]
+
             try:
-                report = fut.result()
-                print(f"\n=== Replay Report [{serial}] ===")
+                report = future.result()
+
+                print(
+                    f"\n=== Replay Report [{serial}] ==="
+                )
+
                 print(json.dumps(report, indent=2))
+
             except Exception as exc:
-                print(f"[!] Device {serial} crashed during replay: {exc}")
+                print(
+                    f"[!] Device {serial} crashed during replay: "
+                    f"{exc}"
+                )
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python replay_engine.py <path/to/recording.json> <SERIAL_1> [SERIAL_2 ...]")
-        sys.exit(1)
-    run_fleet_replay(sys.argv[1], sys.argv[2:])
+    parser = argparse.ArgumentParser(
+        description=(
+            "Replay an Android recording using "
+            "a selectable QA persona."
+        )
+    )
+
+    parser.add_argument(
+        "recording_json",
+        help="Path to recording.json",
+    )
+
+    parser.add_argument(
+        "serials",
+        nargs="+",
+        help="Target ADB serials",
+    )
+
+    parser.add_argument(
+        "--persona",
+        choices=[
+            *personas.ARCHETYPE_NAMES,
+            "random",
+        ],
+        default=None,
+        help="Omit to select interactively.",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional seed for reproducible persona traits.",
+    )
+
+    parser.add_argument(
+        "--profile",
+        choices=tuple(REPLAY_PROFILES),
+        default="baseline",
+        help="Overall QA timing profile.",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        archetype = choose_persona(args.persona)
+
+        selected_persona = make_persona(
+            archetype,
+            args.seed,
+        )
+
+        run_fleet_replay(
+            args.recording_json,
+            args.serials,
+            persona=selected_persona,
+            profile_name=args.profile,
+        )
+
+    except (
+        ValueError,
+        OSError,
+        json.JSONDecodeError,
+    ) as exc:
+        print(f"[!] Replay could not start: {exc}")
+        sys.exit(2)
