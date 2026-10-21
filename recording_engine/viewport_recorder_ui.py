@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QLineEdit,
+    QScrollArea,
+    QFrame,
 )
 
 # Make the shared persona catalogue available when the recorder is launched
@@ -428,7 +430,21 @@ class RecorderMainWindow(QMainWindow):
         self._directional_swipe_shape: Optional[str] = None
         self._directional_swipe_duration_ms = 0
 
+        # Signature cache avoids rebuilding the step list on every poll when
+        # no new action has been committed.
+        self._step_list_signature = None
+
         self._build_ui()
+
+        # Pointer gestures, keyboard taps and text commits are recorded by the
+        # engine. Polling on the Qt thread keeps the step panel responsive and
+        # avoids adding cross-thread UI updates to the recording engine.
+        self._steps_refresh_timer = QTimer(self)
+        self._steps_refresh_timer.setInterval(200)
+        self._steps_refresh_timer.timeout.connect(self._refresh_step_list)
+        self._steps_refresh_timer.start()
+        self._refresh_step_list(force=True)
+
         QTimer.singleShot(0, self.viewport.setFocus)
 
         self.adjustSize()
@@ -571,7 +587,46 @@ class RecorderMainWindow(QMainWindow):
         swipe_hint.setStyleSheet("color: #888; font-size: 10px;")
         right_col.addWidget(swipe_hint)
 
-        right_col.addStretch()
+        # -------------------------------------------------------------
+        # LIVE RECORDED-STEPS PANEL
+        # -------------------------------------------------------------
+        steps_header = QHBoxLayout()
+        self.steps_count_label = QLabel("Recorded Steps (0)")
+        self.steps_count_label.setStyleSheet(
+            "font-weight: bold; color: #e4e4e7; padding-top: 5px;"
+        )
+        steps_header.addWidget(self.steps_count_label)
+        steps_header.addStretch(1)
+        right_col.addLayout(steps_header)
+
+        self.steps_scroll = QScrollArea()
+        self.steps_scroll.setWidgetResizable(True)
+        self.steps_scroll.setMinimumWidth(270)
+        self.steps_scroll.setMinimumHeight(170)
+        self.steps_scroll.setMaximumHeight(340)
+        self.steps_scroll.setFrameShape(QFrame.NoFrame)
+        self.steps_scroll.setStyleSheet(
+            "QScrollArea { background: #101014; border: 1px solid #303039; "
+            "border-radius: 6px; }"
+        )
+
+        self.steps_host = QWidget()
+        self.steps_host.setStyleSheet("background: transparent;")
+        self.steps_rows_layout = QVBoxLayout(self.steps_host)
+        self.steps_rows_layout.setContentsMargins(5, 5, 5, 5)
+        self.steps_rows_layout.setSpacing(5)
+        self.steps_scroll.setWidget(self.steps_host)
+        right_col.addWidget(self.steps_scroll, 1)
+
+        steps_note = QLabel(
+            "Remove deletes an action from the saved recording only; "
+            "it does not undo the action already performed on the phone."
+        )
+        steps_note.setWordWrap(True)
+        steps_note.setStyleSheet("color: #888; font-size: 9px;")
+        right_col.addWidget(steps_note)
+
+        right_col.addStretch(1)
 
         save_btn = QPushButton("Stop & Export JSON")
         save_btn.setFocusPolicy(Qt.NoFocus)
@@ -590,6 +645,184 @@ class RecorderMainWindow(QMainWindow):
 
         self.statusBar().showMessage(
             "Recording active — drag on the preview or use arrow keys / swipe buttons."
+        )
+
+    def _step_description(self, step) -> str:
+        """Return a compact, readable description for a recorded action."""
+        event_type = str(getattr(step, "event_type", "ACTION") or "ACTION").upper()
+        trajectory = getattr(step, "trajectory", None) or []
+
+        if event_type == "TEXT_INPUT":
+            text = str(getattr(step, "text_payload", "") or "")
+            text = text.replace("\n", "\\n").replace("\r", "\\r")
+            if len(text) > 34:
+                text = text[:31] + "..."
+            return f'Text: "{text}"'
+
+        if event_type == "KEY_EVENT":
+            keycode = getattr(step, "keycode", None)
+            key_names = {
+                3: "Home", 4: "Back", 24: "Volume Up",
+                25: "Volume Down", 26: "Power / Lock",
+                66: "Enter / Search", 187: "Recents",
+            }
+            return f"Key: {key_names.get(keycode, f'keycode {keycode}')}"
+
+        if event_type == "SWIPE" and len(trajectory) >= 2:
+            first, last = trajectory[0], trajectory[-1]
+            dx = int(getattr(last, "x", 0)) - int(getattr(first, "x", 0))
+            dy = int(getattr(last, "y", 0)) - int(getattr(first, "y", 0))
+            if abs(dx) >= abs(dy):
+                direction = "right →" if dx >= 0 else "left ←"
+            else:
+                direction = "down ↓" if dy >= 0 else "up ↑"
+            return f"Swipe {direction}  ({abs(dx)} × {abs(dy)} px)"
+
+        if event_type in {"TAP", "LONG_PRESS"} and trajectory:
+            point = trajectory[0]
+            anchor = getattr(step, "anchor", None)
+            anchor_text = str(getattr(anchor, "text", "") or "").strip()
+            if anchor_text:
+                if len(anchor_text) > 24:
+                    anchor_text = anchor_text[:21] + "..."
+                detail = f' · "{anchor_text}"'
+            else:
+                detail = f' · ({getattr(point, "x", 0)}, {getattr(point, "y", 0)})'
+            label = "Long press" if event_type == "LONG_PRESS" else "Tap"
+            return label + detail
+
+        return event_type.replace("_", " ").title()
+
+    def _refresh_step_list(self, force: bool = False):
+        """Refresh the live action list only when the engine's steps change."""
+        steps = list(getattr(self.engine, "steps", []))
+        signature = tuple(
+            (
+                getattr(step, "step_id", index),
+                getattr(step, "timestamp", None),
+                getattr(step, "event_type", ""),
+                getattr(step, "text_payload", None),
+                getattr(step, "keycode", None),
+            )
+            for index, step in enumerate(steps, start=1)
+        )
+        if not force and signature == self._step_list_signature:
+            return
+
+        self._step_list_signature = signature
+        previous_scroll_value = self.steps_scroll.verticalScrollBar().value()
+        self.steps_count_label.setText(f"Recorded Steps ({len(steps)})")
+
+        while self.steps_rows_layout.count():
+            item = self.steps_rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        if not steps:
+            empty = QLabel("No steps recorded yet.\nInteract with the phone to add steps.")
+            empty.setWordWrap(True)
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setMinimumHeight(90)
+            empty.setStyleSheet("color: #888; padding: 12px;")
+            self.steps_rows_layout.addWidget(empty)
+        else:
+            for position, step in enumerate(steps, start=1):
+                row = QFrame()
+                row.setStyleSheet(
+                    "QFrame { background: #19191f; border: 1px solid #303039; "
+                    "border-radius: 5px; }"
+                )
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(7, 5, 5, 5)
+                row_layout.setSpacing(6)
+
+                description = self._step_description(step)
+                detail = QLabel(f"#{position}  {description}")
+                detail.setWordWrap(True)
+                detail.setToolTip(
+                    f"Recorded action #{position} (internal id {getattr(step, 'step_id', position)}): "
+                    f"{description}\nType: {getattr(step, 'event_type', 'ACTION')}"
+                )
+                detail.setStyleSheet(
+                    "color: #e4e4e7; font-size: 10px; border: none;"
+                )
+                row_layout.addWidget(detail, 1)
+
+                remove_btn = QPushButton("×")
+                remove_btn.setFixedSize(27, 27)
+                remove_btn.setFocusPolicy(Qt.NoFocus)
+                remove_btn.setToolTip(
+                    "Remove this action from the saved recording. "
+                    "This does not undo it on the phone."
+                )
+                remove_btn.setStyleSheet(
+                    "QPushButton { background: #3b171b; color: #fda4af; "
+                    "border: 1px solid #7f1d1d; border-radius: 4px; "
+                    "font-weight: bold; font-size: 16px; }"
+                    "QPushButton:hover { background: #7f1d1d; color: white; }"
+                )
+                step_id = getattr(step, "step_id", position)
+                remove_btn.clicked.connect(
+                    lambda checked=False, sid=step_id: self._remove_recorded_step(sid)
+                )
+                row_layout.addWidget(remove_btn, 0, Qt.AlignTop)
+                self.steps_rows_layout.addWidget(row)
+
+        self.steps_rows_layout.addStretch(1)
+        # Keep newest actions visible when recording continues; for a deletion,
+        # preserve a valid nearby scroll position.
+        if len(steps) > 0:
+            self.steps_scroll.verticalScrollBar().setValue(
+                self.steps_scroll.verticalScrollBar().maximum()
+            )
+        else:
+            self.steps_scroll.verticalScrollBar().setValue(previous_scroll_value)
+
+    def _remove_recorded_step(self, step_id: int):
+        """Remove one action from the export list and preserve surrounding delay."""
+        steps = self.engine.steps
+        index = next(
+            (i for i, step in enumerate(steps)
+             if getattr(step, "step_id", None) == step_id),
+            None,
+        )
+        if index is None:
+            self.statusBar().showMessage("That step is no longer in the recording.")
+            self._refresh_step_list(force=True)
+            return
+
+        removed = steps.pop(index)
+        carried_delay = max(
+            0,
+            int(getattr(removed, "think_time_ms", 0) or 0)
+            + int(getattr(removed, "duration_ms", 0) or 0),
+        )
+        if index < len(steps):
+            # Fold the removed action's preceding wait and duration into the next
+            # retained step, preserving the approximate time gap in replay.
+            next_step = steps[index]
+            next_step.think_time_ms = max(
+                0,
+                int(getattr(next_step, "think_time_ms", 0) or 0) + carried_delay,
+            )
+        else:
+            # If the last step is removed during recording, roll the engine clock
+            # back to the end of the previous retained step so the next action's
+            # think-time is measured from the correct point.
+            last_end = getattr(self.engine, "_last_step_end_ts", None)
+            if last_end is not None and carried_delay:
+                self.engine._last_step_end_ts = max(
+                    0.0,
+                    float(last_end) - carried_delay / 1000.0,
+                )
+
+        # Keep the engine's monotonic internal counter unchanged. IDs are stable
+        # for delete callbacks and crop paths; list positions are the UI numbering.
+        self._refresh_step_list(force=True)
+        self.statusBar().showMessage(
+            f"Removed recorded action #{index + 1}. "
+            "It will not be included in the exported JSON; the phone action was not undone."
         )
 
     def _on_new_frame(self, frame_bgr: np.ndarray):
@@ -958,6 +1191,8 @@ class RecorderMainWindow(QMainWindow):
 
     def _finish_session(self):
         self._cancel_directional_swipe()
+        if hasattr(self, "_steps_refresh_timer"):
+            self._steps_refresh_timer.stop()
         self.stream.stop()
         out_path = self.engine.stop_and_export()
 
@@ -966,6 +1201,8 @@ class RecorderMainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._cancel_directional_swipe()
+        if hasattr(self, "_steps_refresh_timer"):
+            self._steps_refresh_timer.stop()
         self.stream.stop()
         super().closeEvent(event)
 
