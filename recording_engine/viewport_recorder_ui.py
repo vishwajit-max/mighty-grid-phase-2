@@ -1,3 +1,6 @@
+import argparse
+import math
+import random
 import socket
 import subprocess
 import sys
@@ -11,7 +14,7 @@ import av
 import cv2
 import numpy as np
 
-from PySide6.QtCore import Qt, Signal, QObject, QPoint
+from PySide6.QtCore import Qt, Signal, QObject, QPoint, QTimer
 from PySide6.QtGui import QImage, QPixmap, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -19,11 +22,20 @@ from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
+    QGridLayout,
     QLabel,
     QPushButton,
     QLineEdit,
 )
 
+# Make the shared persona catalogue available when the recorder is launched
+# directly or as a subprocess from the FastAPI dashboard.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+TELEMETRY_DIR = PROJECT_ROOT / "android_telemetry" / "telemetry"
+if str(TELEMETRY_DIR) not in sys.path:
+    sys.path.insert(0, str(TELEMETRY_DIR))
+
+import personas
 from recorder_engine import AndroidRecordingEngine
 
 
@@ -223,7 +235,9 @@ class ScrcpyStreamWorker:
 # =====================================================================
 
 class DeviceViewportLabel(QLabel):
-    """Render the phone screen and translate mouse input to device pixels."""
+    """Render the phone screen and translate mouse/keyboard input to device actions."""
+
+    swipe_requested = Signal(str)
 
     def __init__(
         self,
@@ -245,6 +259,7 @@ class DeviceViewportLabel(QLabel):
             "background-color: #111; border: 1px solid #333;"
         )
         self.setAlignment(Qt.AlignCenter)
+        self.setFocusPolicy(Qt.StrongFocus)
         self._is_pressing = False
 
     def _to_device_coords(
@@ -278,6 +293,7 @@ class DeviceViewportLabel(QLabel):
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
+            self.setFocus(Qt.MouseFocusReason)
             self._is_pressing = True
 
             dx, dy = self._to_device_coords(
@@ -316,18 +332,52 @@ class DeviceViewportLabel(QLabel):
                 dy,
             )
 
+    def keyPressEvent(self, event):
+        """Arrow keys trigger a recorded swipe when the viewport has focus."""
+        if event.isAutoRepeat():
+            event.accept()
+            return
+
+        direction_by_key = {
+            Qt.Key_Up: "up",
+            Qt.Key_Down: "down",
+            Qt.Key_Left: "left",
+            Qt.Key_Right: "right",
+        }
+        direction = direction_by_key.get(event.key())
+        if direction is not None:
+            self.swipe_requested.emit(direction)
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
+
 
 # =====================================================================
 # 3. HOST RECORDER WINDOW
 # =====================================================================
 
 class RecorderMainWindow(QMainWindow):
-    def __init__(self, serial: str):
+    def __init__(
+        self,
+        serial: str,
+        persona_name: str = "average",
+        persona_seed: Optional[int] = None,
+    ):
         super().__init__()
 
         self.serial = serial
+        # Recreate the exact sampled persona selected in the dashboard. Passing
+        # its seed makes Random and the named personas reproducible.
+        self.persona = personas.generate_persona(
+            seed=persona_seed,
+            archetype=persona_name,
+        )
+        self.persona_name = self.persona.archetype
+        self.persona_seed = self.persona.seed
+        self._gesture_rng = random.Random(self.persona_seed ^ 0x5A17C3)
         self.setWindowTitle(
-            f"Android Recorder Studio — [{serial}]"
+            f"Android Recorder Studio — [{serial}] — {self.persona.name}"
         )
 
         self.engine = AndroidRecordingEngine(
@@ -360,8 +410,26 @@ class RecorderMainWindow(QMainWindow):
             canvas_w,
             canvas_h,
         )
+        self.viewport.swipe_requested.connect(
+            self._start_directional_swipe
+        )
+
+        # A timer animates programmed swipes without sleeping/blocking the UI.
+        self._directional_swipe_timer = QTimer(self)
+        self._directional_swipe_timer.setInterval(16)  # approximately 60 updates/sec
+        self._directional_swipe_timer.timeout.connect(
+            self._advance_directional_swipe
+        )
+        self._directional_swipe_points: list[tuple[int, int]] = []
+        self._directional_swipe_intervals: list[int] = []
+        self._directional_swipe_index = 0
+        self._directional_swipe_last = (0, 0)
+        self._directional_swipe_direction: Optional[str] = None
+        self._directional_swipe_shape: Optional[str] = None
+        self._directional_swipe_duration_ms = 0
 
         self._build_ui()
+        QTimer.singleShot(0, self.viewport.setFocus)
 
         self.adjustSize()
         win_geo = self.frameGeometry()
@@ -421,6 +489,7 @@ class RecorderMainWindow(QMainWindow):
 
         send_btn = QPushButton("Inject")
         send_btn.setFixedHeight(30)
+        send_btn.setFocusPolicy(Qt.NoFocus)
         send_btn.clicked.connect(
             self._send_semantic_text
         )
@@ -446,6 +515,8 @@ class RecorderMainWindow(QMainWindow):
             btn = QPushButton(label)
             btn.setFixedHeight(32)
             btn.setMinimumWidth(145)
+            # Keep keyboard focus on the viewport, unless the text bar is active.
+            btn.setFocusPolicy(Qt.NoFocus)
 
             btn.clicked.connect(
                 lambda checked=False, kc=keycode:
@@ -454,9 +525,56 @@ class RecorderMainWindow(QMainWindow):
 
             right_col.addWidget(btn)
 
+        # Compact directional pad for common scroll/navigation gestures.
+        swipe_title = QLabel("Swipe / Scroll")
+        swipe_title.setStyleSheet("font-weight: bold; padding-top: 5px;")
+        right_col.addWidget(swipe_title)
+
+        self.gesture_profile_label = QLabel(
+            f"Gesture profile: {self.persona_name.title()}  ·  seed {self.persona_seed}"
+        )
+        self.gesture_profile_label.setWordWrap(True)
+        self.gesture_profile_label.setToolTip(
+            "Generated directional swipes use this persona's motion profile, "
+            "flick vigor, tremor, curve bias and fling bias."
+        )
+        self.gesture_profile_label.setStyleSheet(
+            "color: #a5b4fc; font-size: 10px; padding-bottom: 3px;"
+        )
+        right_col.addWidget(self.gesture_profile_label)
+
+        swipe_pad = QGridLayout()
+        swipe_pad.setContentsMargins(0, 0, 0, 0)
+        swipe_pad.setHorizontalSpacing(4)
+        swipe_pad.setVerticalSpacing(4)
+
+        swipe_buttons = [
+            ("↑", "up", 0, 1, "Swipe up / scroll forward"),
+            ("←", "left", 1, 0, "Swipe left"),
+            ("↓", "down", 1, 1, "Swipe down / scroll backward"),
+            ("→", "right", 1, 2, "Swipe right"),
+        ]
+        for caption, direction, row, column, tooltip in swipe_buttons:
+            btn = QPushButton(caption)
+            btn.setFixedSize(44, 34)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setToolTip(tooltip + f" (arrow key: {direction})")
+            btn.clicked.connect(
+                lambda checked=False, d=direction:
+                    self._start_directional_swipe(d)
+            )
+            swipe_pad.addWidget(btn, row, column)
+
+        right_col.addLayout(swipe_pad)
+        swipe_hint = QLabel("Focus the phone preview, then use ↑ ↓ ← →")
+        swipe_hint.setWordWrap(True)
+        swipe_hint.setStyleSheet("color: #888; font-size: 10px;")
+        right_col.addWidget(swipe_hint)
+
         right_col.addStretch()
 
         save_btn = QPushButton("Stop & Export JSON")
+        save_btn.setFocusPolicy(Qt.NoFocus)
         save_btn.setFixedHeight(38)
         save_btn.setStyleSheet(
             "background-color: #d9534f; color: white; "
@@ -471,7 +589,7 @@ class RecorderMainWindow(QMainWindow):
         main_layout.addLayout(right_col)
 
         self.statusBar().showMessage(
-            "Recording active — interact with viewport or toolbar."
+            "Recording active — drag on the preview or use arrow keys / swipe buttons."
         )
 
     def _on_new_frame(self, frame_bgr: np.ndarray):
@@ -500,6 +618,253 @@ class RecorderMainWindow(QMainWindow):
         )
 
         self.viewport.setPixmap(pix)
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
+
+    def _make_persona_swipe_path(
+        self,
+        direction: str,
+        width: int,
+        height: int,
+    ) -> tuple[tuple[int, int], list[tuple[int, int]], list[int], int, str]:
+        """Build a bounded directional QA gesture using the selected persona.
+
+        The requested direction and endpoints are preserved. The selected profile
+        only varies path shape, cross-axis drift, speed and timing within safe
+        screen bounds; it does not change what direction the user requested.
+        """
+        rng = self._gesture_rng
+        profile = self.persona.swipe_profile
+
+        fling = self._clamp(float(self.persona.fling_bias), 0.0, 1.0)
+        travel_fraction = 0.44 + 0.22 * fling
+        center_x, center_y = width / 2.0, height / 2.0
+        if direction == "up":
+            start = (round(center_x), round(height * (0.5 + travel_fraction / 2)))
+            end = (round(center_x), round(height * (0.5 - travel_fraction / 2)))
+        elif direction == "down":
+            start = (round(center_x), round(height * (0.5 - travel_fraction / 2)))
+            end = (round(center_x), round(height * (0.5 + travel_fraction / 2)))
+        elif direction == "left":
+            start = (round(width * (0.5 + travel_fraction / 2)), round(center_y))
+            end = (round(width * (0.5 - travel_fraction / 2)), round(center_y))
+        else:  # right
+            start = (round(width * (0.5 - travel_fraction / 2)), round(center_y))
+            end = (round(width * (0.5 + travel_fraction / 2)), round(center_y))
+
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        distance = max(1.0, math.hypot(dx, dy))
+        perp_x, perp_y = -dy / distance, dx / distance
+
+        lateral_values = profile.get("lateral_ratio", (0.008, 0.04, 0.09))
+        if not isinstance(lateral_values, (tuple, list)) or len(lateral_values) != 3:
+            lateral_values = (0.008, 0.04, 0.09)
+        lateral_low, lateral_typical, lateral_high = map(float, lateral_values)
+        lateral_low = max(0.0, lateral_low)
+        lateral_high = max(lateral_low, lateral_high)
+        lateral_typical = self._clamp(lateral_typical, lateral_low, lateral_high)
+        lateral_ratio = rng.triangular(lateral_low, lateral_high, lateral_typical)
+        lateral_amplitude = min(distance * lateral_ratio, min(width, height) * 0.095)
+
+        weights = profile.get("shape_weights", {})
+        shape_names = [name for name, weight in weights.items() if float(weight) > 0]
+        shape_weights = [float(weights[name]) for name in shape_names]
+        shape = (
+            rng.choices(shape_names, weights=shape_weights, k=1)[0]
+            if shape_names and sum(shape_weights) > 0
+            else "single_bend"
+        )
+
+        tremor = self._clamp(float(self.persona.tremor_scale), 0.3, 2.0)
+        roughness = self._clamp(float(profile.get("roughness", 0.3)) * tremor, 0.04, 1.0)
+        curve_sign = 1.0 if float(self.persona.curve_bias) >= 0 else -1.0
+        bend_sign = curve_sign * rng.choice((-1.0, 1.0))
+        phase_a = rng.uniform(-math.pi, math.pi)
+        phase_b = rng.uniform(-math.pi, math.pi)
+        phase_c = rng.uniform(-math.pi, math.pi)
+        wander_nodes = [rng.uniform(-1.0, 1.0) for _ in range(6)]
+
+        vigor = self._clamp(float(self.persona.flick_vigor), 0.5, 1.8)
+        dwell = self._clamp(float(self.persona.dwell_scale), 0.5, 1.8)
+        duration_ms = round(350.0 / vigor * (0.94 + 0.12 * dwell))
+        duration_ms = int(self._clamp(duration_ms, 210, 540))
+        step_count = max(13, min(36, round(duration_ms / 16)))
+
+        # Higher vigor produces a brisker ease-out; the end point remains exact.
+        ease_power = self._clamp(1.05 + (vigor - 0.8) * 0.55, 0.9, 1.45)
+        noise_amplitude = min(
+            min(width, height) * 0.026 * roughness,
+            min(width, height) * 0.035,
+        )
+
+        points: list[tuple[int, int]] = []
+        for index in range(1, step_count + 1):
+            t = index / step_count
+            progress = 1.0 - (1.0 - t) ** ease_power
+            base_x = start[0] + dx * progress
+            base_y = start[1] + dy * progress
+
+            # Select a motion shape from this archetype's profile. The final
+            # point is forced onto the exact requested endpoint below.
+            if shape == "near_line":
+                shape_curve = 0.16 * math.sin(math.pi * t)
+            elif shape == "shallow_s":
+                shape_curve = 0.55 * math.sin(2.0 * math.pi * t)
+            elif shape == "wander":
+                scaled = t * (len(wander_nodes) - 1)
+                node_index = min(len(wander_nodes) - 2, int(scaled))
+                local_t = scaled - node_index
+                # Smoothly blend adjacent knots to avoid abrupt corners.
+                local_t = local_t * local_t * (3.0 - 2.0 * local_t)
+                wander = (
+                    wander_nodes[node_index] * (1.0 - local_t)
+                    + wander_nodes[node_index + 1] * local_t
+                )
+                shape_curve = wander * math.sin(math.pi * t)
+            else:  # single_bend
+                shape_curve = bend_sign * math.sin(math.pi * t)
+
+            micro_wiggle = (
+                0.48 * math.sin(2.0 * math.pi * t + phase_a)
+                + 0.32 * math.sin(4.0 * math.pi * t + phase_b)
+                + 0.20 * math.sin(7.0 * math.pi * t + phase_c)
+            ) * math.sin(math.pi * t)
+
+            offset = (lateral_amplitude * shape_curve) + (noise_amplitude * micro_wiggle)
+            x = round(base_x + perp_x * offset)
+            y = round(base_y + perp_y * offset)
+
+            # Keep all points inside the device canvas and keep the swipe's
+            # direction by retaining monotonic progress along its main axis.
+            x = int(self._clamp(x, 1, width - 2))
+            y = int(self._clamp(y, 1, height - 2))
+            if index == step_count:
+                x, y = end
+            points.append((x, y))
+
+        # Timing varies within a small profile-based envelope, keeping the Qt UI
+        # responsive while allowing shakier profiles to have less uniform motion.
+        burstiness = self._clamp(float(self.persona.burstiness), 0.7, 2.8)
+        timing_variation = min(0.24, 0.035 + 0.14 * roughness + 0.035 * abs(burstiness - 1.4))
+        nominal_interval = duration_ms / step_count
+        intervals = [
+            int(self._clamp(
+                round(nominal_interval * rng.uniform(1.0 - timing_variation, 1.0 + timing_variation)),
+                8, 32,
+            ))
+            for _ in points
+        ]
+        return start, points, intervals, duration_ms, shape
+
+    def _start_directional_swipe(self, direction: str):
+        """Start a persona-shaped, animated and recorded directional swipe."""
+        direction = str(direction).strip().lower()
+        if direction not in {"up", "down", "left", "right"}:
+            self.statusBar().showMessage(f"Unknown swipe direction: {direction}")
+            return
+
+        if self._directional_swipe_timer.isActive():
+            self.statusBar().showMessage("A directional swipe is already in progress.")
+            return
+
+        if getattr(self.engine, "_active_samples", None):
+            self.statusBar().showMessage("Finish the current touch gesture first.")
+            return
+
+        width = int(self.engine.maatouch.max_x)
+        height = int(self.engine.maatouch.max_y)
+        if width <= 0 or height <= 0:
+            self.statusBar().showMessage("Could not determine Android screen dimensions.")
+            return
+
+        try:
+            start, points, intervals, duration_ms, shape = self._make_persona_swipe_path(
+                direction, width, height
+            )
+            self._directional_swipe_points = points
+            self._directional_swipe_intervals = intervals
+            self._directional_swipe_index = 0
+            self._directional_swipe_last = start
+            self._directional_swipe_direction = direction
+            self._directional_swipe_shape = shape
+            self._directional_swipe_duration_ms = duration_ms
+            self.engine.on_viewport_pointer_down(*start)
+        except Exception as exc:
+            self._clear_directional_swipe_state()
+            self.statusBar().showMessage(f"Could not start swipe: {exc}")
+            return
+
+        self.viewport.setFocus(Qt.OtherFocusReason)
+        self._directional_swipe_timer.setInterval(self._directional_swipe_intervals[0])
+        self.statusBar().showMessage(
+            f"{self.persona_name.title()} profile: {direction} swipe "
+            f"({duration_ms} ms, {shape} path)"
+        )
+        self._directional_swipe_timer.start()
+
+    def _advance_directional_swipe(self):
+        """Advance one animated touch sample; never sleeps in the UI thread."""
+        if self._directional_swipe_index >= len(self._directional_swipe_points):
+            self._complete_directional_swipe()
+            return
+
+        point = self._directional_swipe_points[self._directional_swipe_index]
+        try:
+            self.engine.on_viewport_pointer_move(*point)
+            self._directional_swipe_last = point
+            self._directional_swipe_index += 1
+            if self._directional_swipe_index >= len(self._directional_swipe_points):
+                self._complete_directional_swipe()
+            else:
+                self._directional_swipe_timer.setInterval(
+                    self._directional_swipe_intervals[self._directional_swipe_index]
+                )
+        except Exception as exc:
+            self._directional_swipe_timer.stop()
+            self.statusBar().showMessage(f"Swipe interrupted: {exc}")
+            # Release the device contact if move processing failed mid-gesture.
+            try:
+                self.engine.on_viewport_pointer_up(*self._directional_swipe_last)
+            except Exception:
+                pass
+            self._clear_directional_swipe_state()
+
+    def _complete_directional_swipe(self):
+        self._directional_swipe_timer.stop()
+        direction = self._directional_swipe_direction or "directional"
+        point = self._directional_swipe_last
+        try:
+            self.engine.on_viewport_pointer_up(*point)
+            self.statusBar().showMessage(
+                f"Recorded {self.persona_name.title()} {direction} swipe "
+                f"as a SWIPE action (Step #{len(self.engine.steps)})."
+            )
+        except Exception as exc:
+            self.statusBar().showMessage(f"Could not finish swipe: {exc}")
+        finally:
+            self._clear_directional_swipe_state()
+
+    def _clear_directional_swipe_state(self):
+        self._directional_swipe_points = []
+        self._directional_swipe_intervals = []
+        self._directional_swipe_index = 0
+        self._directional_swipe_direction = None
+        self._directional_swipe_shape = None
+        self._directional_swipe_duration_ms = 0
+
+    def _cancel_directional_swipe(self):
+        """Release an in-progress generated swipe before export or window close."""
+        if not self._directional_swipe_timer.isActive():
+            return
+        self._directional_swipe_timer.stop()
+        point = self._directional_swipe_last
+        try:
+            self.engine.on_viewport_pointer_up(*point)
+        except Exception:
+            pass
+        self._clear_directional_swipe_state()
 
     def _sync_text_live(self, current_text: str):
         """
@@ -592,6 +957,7 @@ class RecorderMainWindow(QMainWindow):
         )
 
     def _finish_session(self):
+        self._cancel_directional_swipe()
         self.stream.stop()
         out_path = self.engine.stop_and_export()
 
@@ -599,21 +965,36 @@ class RecorderMainWindow(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
+        self._cancel_directional_swipe()
         self.stream.stop()
         super().closeEvent(event)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(
-            "Usage: python viewport_recorder_ui.py <DEVICE_SERIAL>"
-        )
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="MightyGrid Android viewport recorder"
+    )
+    parser.add_argument("serial", help="ADB serial of the Android device")
+    parser.add_argument(
+        "--persona",
+        default="average",
+        choices=[*personas.ARCHETYPE_NAMES, "random"],
+        help="Persona used to shape generated directional swipes",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Persona seed from the dashboard; preserves the sampled profile",
+    )
+    args = parser.parse_args()
 
-    app = QApplication(sys.argv)
+    app = QApplication(sys.argv[:1])
 
     win = RecorderMainWindow(
-        serial=sys.argv[1]
+        serial=args.serial,
+        persona_name=args.persona,
+        persona_seed=args.seed,
     )
     win.show()
 

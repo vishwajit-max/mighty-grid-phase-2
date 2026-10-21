@@ -151,7 +151,7 @@ export default function MightyGridStudio() {
     if (isFetchingRef.current) return;
     isFetchingRef.current = true;
     setIsScanning(true);
-
+    
     // Generate a timestamp to completely bust the browser GET cache
     const cacheBuster = `?t=${Date.now()}`;
 
@@ -171,8 +171,6 @@ export default function MightyGridStudio() {
 
       const recs: Recording[] = recRes.recordings || [];
       setRecordings(recs);
-      
-      // Auto-select the newest recording if the list isn't empty
       if (recs.length > 0) {
         setSelectedRecording(recs[0].path);
       }
@@ -217,7 +215,6 @@ export default function MightyGridStudio() {
     terminalEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
-  // Every persona selection gets a fresh sample from that archetype's own ranges.
   const handleSelectPersona = async (arch: string) => {
     setActivePersona(arch);
     try {
@@ -246,13 +243,38 @@ export default function MightyGridStudio() {
       appendLog("[!] Select exactly ONE primary device card to launch the 60FPS Recorder.");
       return;
     }
+    let chosenMetrics = personas[activePersona];
     setSystemState("RECORDING");
     try {
-      await fetch(`${API_BASE}/api/record/start`, {
+      if (chosenMetrics?.seed == null) {
+        const personaEndpoint = activePersona === "random"
+          ? `${API_BASE}/api/personas/random`
+          : `${API_BASE}/api/personas/${encodeURIComponent(activePersona)}`;
+        const personaResponse = await fetch(personaEndpoint, { cache: "no-store" });
+        if (!personaResponse.ok) {
+          throw new Error(`Could not load ${activePersona} persona (${personaResponse.status}).`);
+        }
+        chosenMetrics = await personaResponse.json() as PersonaMetrics;
+        setPersonas((prev) => ({ ...prev, [activePersona]: chosenMetrics! }));
+      }
+      const seedToUse = chosenMetrics.seed;
+      const response = await fetch(`${API_BASE}/api/record/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ serial: selectedSerials[0] }),
+        body: JSON.stringify({
+          serial: selectedSerials[0],
+          persona: activePersona,
+          seed: seedToUse,
+        }),
       });
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Recorder launch failed (${response.status}): ${detail}`);
+      }
+      appendLog(
+        `[*] Recorder launched with ${activePersona} gesture profile` +
+        (seedToUse !== undefined ? ` (seed ${seedToUse}).` : ".")
+      );
     } catch (e) {
       appendLog(`[!] Recorder launch failed: ${e}`);
       setSystemState("IDLE");
@@ -272,8 +294,6 @@ export default function MightyGridStudio() {
     setSystemState("REPLAYING");
 
     const chosenMetrics = personas[activePersona];
-    // Pass the sample's seed for every archetype so replay reproduces the exact
-    // values shown in this card (including the archetype selected by Random).
     const seedToUse = chosenMetrics?.seed;
 
     try {
@@ -327,7 +347,6 @@ export default function MightyGridStudio() {
       <div className="pointer-events-none fixed -top-40 -left-40 w-[520px] h-[520px] rounded-full bg-indigo-600/15 blur-[130px]" />
       <div className="pointer-events-none fixed -bottom-40 -right-40 w-[520px] h-[520px] rounded-full bg-fuchsia-600/10 blur-[140px]" />
 
-      {/* TOP HEADER */}
       <header className="h-16 border-b border-white/[0.07] bg-[#0B0B10]/80 backdrop-blur-xl px-6 flex items-center justify-between z-10">
         <div className="flex items-center gap-3.5">
           <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 via-violet-500 to-fuchsia-500 flex items-center justify-center shadow-[0_0_25px_-3px_rgba(99,102,241,0.6)] border border-white/20">
@@ -383,10 +402,8 @@ export default function MightyGridStudio() {
         </div>
       </header>
 
-      {/* MAIN WORKSPACE */}
       <main className="flex-1 grid grid-cols-12 gap-5 p-6 max-w-[1600px] w-full mx-auto z-10">
         <div className="col-span-12 lg:col-span-5 xl:col-span-4 flex flex-col gap-5">
-          {/* 1. CONNECTED FLEET */}
           <section className="rounded-2xl bg-[#0E0E14]/90 border border-white/[0.08] shadow-2xl p-5 flex flex-col gap-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -461,7 +478,6 @@ export default function MightyGridStudio() {
             </div>
           </section>
 
-          {/* 2. BIOMETRIC PERSONA DNA */}
           <section className="rounded-2xl bg-[#0E0E14]/90 border border-white/[0.08] shadow-2xl p-5 flex flex-col gap-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -568,7 +584,6 @@ export default function MightyGridStudio() {
             </div>
           </section>
 
-          {/* 3. SESSION PAYLOAD & ACTION BUTTONS */}
           <section className="rounded-2xl bg-[#0E0E14]/90 border border-white/[0.08] shadow-2xl p-5 flex flex-col gap-4">
             <div className="flex items-center justify-between">
               <label className="text-xs font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-2">
@@ -606,7 +621,6 @@ export default function MightyGridStudio() {
             </select>
 
             <div className="grid grid-cols-1 gap-3 pt-1">
-              {/* Record Button */}
               <button
                 onClick={handleLaunchRecorder}
                 disabled={systemState !== "IDLE"}
@@ -624,7 +638,6 @@ export default function MightyGridStudio() {
                 </div>
               </button>
 
-              {/* Dynamic Replay OR Stop Button */}
               {systemState === "IDLE" ? (
                 <button
                   onClick={handleLaunchReplay}
@@ -656,7 +669,6 @@ export default function MightyGridStudio() {
           </section>
         </div>
 
-        {/* RIGHT COLUMN: TERMINAL */}
         <div className="col-span-12 lg:col-span-7 xl:col-span-8 flex flex-col">
           <div className="flex-1 rounded-2xl bg-[#09090D] border border-white/[0.08] shadow-2xl flex flex-col overflow-hidden">
             <div className="h-12 px-5 bg-[#111118] border-b border-white/[0.07] flex items-center justify-between">

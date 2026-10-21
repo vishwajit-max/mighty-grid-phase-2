@@ -271,6 +271,8 @@ def list_recordings():
 # ---------------------------------------------------------------------
 class RecordRequest(BaseModel):
     serial: str
+    persona: str = "average"
+    seed: Optional[int] = None
 
 
 @app.post("/api/record/start")
@@ -279,10 +281,27 @@ async def start_recorder(req: RecordRequest):
     if not ui_script.exists():
         raise HTTPException(status_code=404, detail="viewport_recorder_ui.py not found")
 
-    loop = asyncio.get_running_loop()
-    print(f"[*] Spawning 60FPS Scrcpy Recorder Viewport on {req.serial}...")
+    if req.persona not in [*personas.ARCHETYPE_NAMES, "random"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown persona '{req.persona}'. Available: {', '.join([*personas.ARCHETYPE_NAMES, 'random'])}",
+        )
 
-    proc = subprocess.Popen([sys.executable, str(ui_script), req.serial], cwd=str(REC_DIR))
+    loop = asyncio.get_running_loop()
+    seed_note = f", seed {req.seed}" if req.seed is not None else ""
+    print(
+        f"[*] Spawning Scrcpy Recorder on {req.serial} "
+        f"with {req.persona.title()} gesture profile{seed_note}..."
+    )
+
+    cmd = [
+        sys.executable, str(ui_script), req.serial,
+        "--persona", req.persona,
+    ]
+    if req.seed is not None:
+        cmd.extend(["--seed", str(req.seed)])
+
+    proc = subprocess.Popen(cmd, cwd=str(REC_DIR))
     with STATE_LOCK:
         ACTIVE_STATE["recorder_proc"] = proc
 
@@ -290,14 +309,19 @@ async def start_recorder(req: RecordRequest):
         proc.wait()
         
         # Give the OS 500ms to flush the session directory and recording.json to disk
-        time.sleep(0.5)
+        time.sleep(0.5) 
         
         with STATE_LOCK:
             ACTIVE_STATE["recorder_proc"] = None
         asyncio.run_coroutine_threadsafe(broadcaster.broadcast("__STATUS__:IDLE"), loop)
 
     threading.Thread(target=_watch_recorder, daemon=True).start()
-    return {"status": "RECORDING_STARTED", "serial": req.serial}
+    return {
+        "status": "RECORDING_STARTED",
+        "serial": req.serial,
+        "persona": req.persona,
+        "seed": req.seed,
+    }
 
 
 class ReplayRequest(BaseModel):
