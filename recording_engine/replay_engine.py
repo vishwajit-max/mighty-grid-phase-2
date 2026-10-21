@@ -1796,11 +1796,12 @@ class DeviceReplayWorker:
 # =====================================================================
 
 def run_fleet_replay(
-    recording_json_path: str,
-    target_serials: List[str],
-    persona,
-    lockstep: bool = True,
+    recording_json_path: str, 
+    target_serials: List[str], 
+    persona_name: str = "random", 
     profile_name: str = "baseline",
+    lockstep: bool = True,
+    persona_obj=None
 ):
     rec_path = Path(recording_json_path)
 
@@ -1817,6 +1818,9 @@ def run_fleet_replay(
         raise ValueError(
             f"Unknown timing profile: {profile_name}"
         )
+
+    # Allow CLI to pass a seeded object, otherwise generate fresh from the API string
+    persona = persona_obj or personas.generate_persona(archetype=persona_name)
 
     number_of_devices = len(target_serials)
     number_of_steps = len(parsed_data.get("steps", []))
@@ -1886,6 +1890,7 @@ def run_fleet_replay(
 
 
 if __name__ == "__main__":
+    import argparse
     parser = argparse.ArgumentParser(
         description=(
             "Replay an Android recording using "
@@ -1927,6 +1932,12 @@ if __name__ == "__main__":
         default="baseline",
         help="Overall QA timing profile.",
     )
+    
+    parser.add_argument(
+        "--no-lockstep", 
+        action="store_true", 
+        help="Disable lockstep synchronization"
+    )
 
     args = parser.parse_args()
 
@@ -1939,10 +1950,12 @@ if __name__ == "__main__":
         )
 
         run_fleet_replay(
-            args.recording_json,
-            args.serials,
-            persona=selected_persona,
+            recording_json_path=args.recording_json,
+            target_serials=args.serials,
+            persona_name=archetype,
             profile_name=args.profile,
+            lockstep=not args.no_lockstep,
+            persona_obj=selected_persona
         )
 
     except (

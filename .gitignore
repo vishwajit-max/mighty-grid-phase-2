@@ -36,3 +36,16 @@ recording_engine/recordings/session_*/
 Thumbs.db
 .vscode/
 .idea/
+
+# ==========================================
+# NEXT.JS & NODE.JS (web-dashboard)
+# ==========================================
+web-dashboard/node_modules/
+web-dashboard/.next/
+web-dashboard/out/
+web-dashboard/.turbo/
+web-dashboard/build/
+web-dashboard/.env*.local
+web-dashboard/npm-debug.log*
+web-dashboard/yarn-debug.log*
+web-dashboard/pnpm-debug.log*
