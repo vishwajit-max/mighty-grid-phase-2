@@ -156,6 +156,35 @@ ARCHETYPES = {
 ARCHETYPE_NAMES = list(ARCHETYPES.keys())
 
 
+def get_persona_ranges(archetype: str) -> dict:
+    """Return the effective sampling range for every generated persona trait.
+
+    Traits not overridden by an archetype use their value range from _BASE.
+    ``curve_bias`` is sampled as a magnitude and then assigned a random sign,
+    so its range metadata describes the magnitude; clients should render it as
+    ±min–max rather than as a plain signed interval.
+    """
+    if archetype == "random":
+        # Ranges depend on the archetype chosen by the random sample. Call this
+        # function with the generated persona's resolved ``p.archetype``.
+        raise ValueError("Resolve the random archetype before requesting ranges")
+    if archetype not in ARCHETYPES:
+        raise ValueError(
+            f"Unknown persona '{archetype}'. Available: {', '.join(ARCHETYPE_NAMES)}, random"
+        )
+
+    effective = dict(_BASE)
+    effective.update(ARCHETYPES[archetype])
+    return {
+        trait: {
+            "min": float(bounds[0]),
+            "max": float(bounds[1]),
+            "signed": trait == "curve_bias",
+        }
+        for trait, bounds in effective.items()
+    }
+
+
 MOTION_PROFILES = {
     "speedy": {
         "shape": "varied",

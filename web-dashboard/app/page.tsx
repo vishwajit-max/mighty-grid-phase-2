@@ -30,6 +30,13 @@ interface Device {
   status: string;
 }
 
+interface PersonaParameter {
+  value: number;
+  min: number;
+  max: number;
+  signed?: boolean;
+}
+
 interface PersonaMetrics {
   name: string;
   archetype?: string;
@@ -40,6 +47,60 @@ interface PersonaMetrics {
   scatter: number;
   reaction_ms: number;
   fling_bias: number;
+  parameters?: Record<string, PersonaParameter>;
+}
+
+const PERSONA_PARAMETER_ORDER = [
+  "wpm",
+  "typo_rate",
+  "burstiness",
+  "scatter_px",
+  "fitts_precision",
+  "reaction_ms",
+  "dwell_scale",
+  "curve_bias",
+  "tremor_scale",
+  "flick_vigor",
+  "overshoot_rate",
+  "fatigue_rate",
+  "fling_bias",
+  "curiosity",
+  "patience",
+];
+
+const PERSONA_PARAMETER_META: Record<string, { label: string; unit?: string; percent?: boolean; decimals?: number }> = {
+  wpm: { label: "Typing speed", unit: "WPM", decimals: 1 },
+  typo_rate: { label: "Typo rate", percent: true, decimals: 1 },
+  burstiness: { label: "Typing burstiness", unit: "×", decimals: 2 },
+  scatter_px: { label: "Touch scatter", unit: "px", decimals: 2 },
+  fitts_precision: { label: "Fitts precision", unit: "×", decimals: 2 },
+  reaction_ms: { label: "Reaction time", unit: "ms", decimals: 0 },
+  dwell_scale: { label: "Touch dwell scale", unit: "×", decimals: 2 },
+  curve_bias: { label: "Gesture curve bias", decimals: 2 },
+  tremor_scale: { label: "Micro-tremor", unit: "σ", decimals: 2 },
+  flick_vigor: { label: "Flick vigor", unit: "×", decimals: 2 },
+  overshoot_rate: { label: "Overshoot rate", percent: true, decimals: 1 },
+  fatigue_rate: { label: "Fatigue rate", percent: true, decimals: 1 },
+  fling_bias: { label: "Fling bias", decimals: 2 },
+  curiosity: { label: "Curiosity", percent: true, decimals: 1 },
+  patience: { label: "Patience", percent: true, decimals: 1 },
+};
+
+function formatPersonaValue(key: string, value: number): string {
+  const meta = PERSONA_PARAMETER_META[key] || { label: key, decimals: 2 };
+  if (meta.percent) return `${(value * 100).toFixed(meta.decimals ?? 1)}%`;
+  if (key === "curve_bias") {
+    return `${value < 0 ? "−" : "+"}${Math.abs(value).toFixed(meta.decimals ?? 2)}`;
+  }
+  const number = value.toFixed(meta.decimals ?? 2);
+  return meta.unit ? `${number} ${meta.unit}` : number;
+}
+
+function formatPersonaRange(key: string, parameter: PersonaParameter): string {
+  if (parameter.signed) {
+    return `±${parameter.min.toFixed(2)}–${parameter.max.toFixed(2)}`;
+  }
+  return `${formatPersonaValue(key, parameter.min)} – ${formatPersonaValue(key, parameter.max)}`;
 }
 
 interface Recording {
@@ -100,7 +161,9 @@ export default function MightyGridStudio() {
       const fetchedDevs: Device[] = devRes.devices || [];
       setDevices(fetchedDevs);
       setSelectedSerials(fetchedDevs.map((d) => d.serial));
-      setPersonas(perRes.personas || {});
+      setPersonas((prev) =>
+        Object.keys(prev).length > 0 ? prev : (perRes.personas || {})
+      );
 
       const recs: Recording[] = recRes.recordings || [];
       setRecordings(recs);
@@ -148,20 +211,21 @@ export default function MightyGridStudio() {
     terminalEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
-  // Every click on "random" rolls a fresh random persona from the backend
+  // Every persona selection gets a fresh sample from that archetype's own ranges.
   const handleSelectPersona = async (arch: string) => {
     setActivePersona(arch);
-    if (arch === "random") {
-      try {
-        const res = await fetch(`${API_BASE}/api/personas/random`);
-        const freshRandom: PersonaMetrics = await res.json();
-        setPersonas((prev) => ({
-          ...prev,
-          random: freshRandom,
-        }));
-      } catch {
-        // fallback if offline
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/personas/${encodeURIComponent(arch)}`,
+        { cache: "no-store" }
+      );
+      if (!res.ok) {
+        throw new Error(`Persona request failed (${res.status})`);
       }
+      const freshPersona: PersonaMetrics = await res.json();
+      setPersonas((prev) => ({ ...prev, [arch]: freshPersona }));
+    } catch (error) {
+      appendLog(`[!] Could not generate a fresh ${arch} persona: ${error}`);
     }
   };
 
@@ -202,7 +266,9 @@ export default function MightyGridStudio() {
     setSystemState("REPLAYING");
 
     const chosenMetrics = personas[activePersona];
-    const seedToUse = activePersona === "random" ? chosenMetrics?.seed : undefined;
+    // Pass the sample's seed for every archetype so replay reproduces the exact
+    // values shown in this card (including the archetype selected by Random).
+    const seedToUse = chosenMetrics?.seed;
 
     try {
       await fetch(`${API_BASE}/api/replay/start`, {
@@ -404,7 +470,7 @@ export default function MightyGridStudio() {
             </div>
 
             <div className="grid grid-cols-3 gap-1.5 bg-zinc-950/90 p-1.5 rounded-xl border border-white/[0.06]">
-              {["average", "speedy", "careful", "shaky", "restless", "random"].map((arch) => {
+              {["average", "speedy", "careful", "shaky", "restless", "careless", "random"].map((arch) => {
                 const active = activePersona === arch;
                 return (
                   <button
@@ -459,6 +525,40 @@ export default function MightyGridStudio() {
                   </div>
                 </div>
               ))}
+            </div>
+
+            <div className="rounded-xl border border-white/[0.07] bg-zinc-950/60 p-3">
+              <div className="flex items-center justify-between mb-2.5">
+                <h3 className="text-[11px] font-bold uppercase tracking-wider text-zinc-300">
+                  All Parameters &amp; Allowed Ranges
+                </h3>
+                <span className="text-[10px] text-zinc-500 font-mono">
+                  Seed {currentMetrics.seed ?? "—"}
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-64 overflow-y-auto pr-1">
+                {PERSONA_PARAMETER_ORDER.map((key) => {
+                  const parameter = currentMetrics.parameters?.[key];
+                  if (!parameter) return null;
+                  const meta = PERSONA_PARAMETER_META[key];
+                  return (
+                    <div
+                      key={key}
+                      className="min-w-0 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-2"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <span className="text-[11px] text-zinc-400 leading-4">{meta.label}</span>
+                        <span className="text-[11px] text-zinc-100 font-mono font-semibold whitespace-nowrap">
+                          {formatPersonaValue(key, parameter.value)}
+                        </span>
+                      </div>
+                      <div className="mt-1 text-[10px] text-zinc-500 font-mono">
+                        Range: {formatPersonaRange(key, parameter)}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </section>
 

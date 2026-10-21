@@ -167,36 +167,82 @@ async def list_devices():
 
 
 def _serialize_persona(p) -> dict:
+    """Return a sampled persona plus the effective range for every trait."""
+    ranges = personas.get_persona_ranges(p.archetype)
+    precision = {
+        "wpm": 1,
+        "typo_rate": 4,
+        "burstiness": 3,
+        "scatter_px": 2,
+        "fitts_precision": 3,
+        "reaction_ms": 1,
+        "dwell_scale": 3,
+        "curve_bias": 3,
+        "tremor_scale": 3,
+        "flick_vigor": 3,
+        "overshoot_rate": 4,
+        "fatigue_rate": 4,
+        "fling_bias": 3,
+        "curiosity": 3,
+        "patience": 3,
+    }
+
+    parameters = {}
+    for trait, trait_range in ranges.items():
+        parameters[trait] = {
+            "value": round(float(getattr(p, trait)), precision.get(trait, 3)),
+            "min": round(trait_range["min"], precision.get(trait, 3)),
+            "max": round(trait_range["max"], precision.get(trait, 3)),
+            "signed": trait_range.get("signed", False),
+        }
+
     return {
         "name": p.name,
         "archetype": p.archetype,
         "seed": p.seed,
+        # Legacy aliases retained for the existing four primary meters.
         "wpm": round(p.wpm, 1),
         "vigor": round(p.flick_vigor, 2),
         "tremor": round(p.tremor_scale, 2),
-        "scatter": round(getattr(p, "scatter_px", 3.5), 1),
+        "scatter": round(p.scatter_px, 1),
         "reaction_ms": round(p.reaction_ms, 0),
-        "fling_bias": round(getattr(p, "fling_bias", 0.5), 2),
+        "fling_bias": round(p.fling_bias, 2),
+        "parameters": parameters,
     }
 
 
 @app.get("/api/personas")
 def list_personas():
-    archetypes = ["average", "speedy", "careful", "shaky", "restless"]
-    out = {}
-    for arch in archetypes:
-        p = personas.generate_persona(seed=42, archetype=arch)
-        out[arch] = _serialize_persona(p)
-    # Generate an initial unseeded random persona
-    out["random"] = _serialize_persona(personas.generate_persona(seed=None, archetype="random"))
+    """Return one fresh, range-constrained sample for every persona on load."""
+    out = {
+        arch: _serialize_persona(personas.generate_persona(seed=None, archetype=arch))
+        for arch in personas.ARCHETYPE_NAMES
+    }
+    out["random"] = _serialize_persona(
+        personas.generate_persona(seed=None, archetype="random")
+    )
     return {"personas": out}
 
 
 @app.get("/api/personas/random")
 def roll_random_persona():
-    """Generates a brand-new random persona seed & traits every time it is clicked."""
-    p = personas.generate_persona(seed=None, archetype="random")
-    return _serialize_persona(p)
+    """Generate a new random archetype and a fresh, reproducible trait sample."""
+    return _serialize_persona(
+        personas.generate_persona(seed=None, archetype="random")
+    )
+
+
+@app.get("/api/personas/{archetype}")
+def roll_persona(archetype: str):
+    """Generate a fresh sample from the requested archetype's defined ranges."""
+    if archetype not in personas.ARCHETYPE_NAMES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown persona '{archetype}'. Available: {', '.join(personas.ARCHETYPE_NAMES)}, random",
+        )
+    return _serialize_persona(
+        personas.generate_persona(seed=None, archetype=archetype)
+    )
 
 
 @app.get("/api/recordings")

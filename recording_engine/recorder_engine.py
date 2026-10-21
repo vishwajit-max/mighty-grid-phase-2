@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import uuid
+import queue
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
@@ -332,16 +333,25 @@ class AndroidRecordingEngine:
         self.steps: List[RecordedStep] = []
         self._step_counter = 0
         self._last_step_end_ts = time.perf_counter()
+
         # Start time for a live text-edit session. The completed text is
         # recorded as one TEXT_INPUT step when the user presses Enter/Inject.
         self._live_text_started_at: Optional[float] = None
-        # Cache keyboard bounds between characters; invalidate when Shift changes
-        # the keyboard layer so typing stays responsive without invisible injection.
-        self._keyboard_node_cache = None
+
+        # Multi-layer keyboard cache: {"alpha": [...], "sym1": [...], "sym2": [...]}
+        self._keyboard_layer_caches: Dict[str, list] = {}
+        self._current_kb_layer: str = "alpha"
         self._keyboard_shift_state: Optional[bool] = None
+
+        # Async worker queue so keyboard taps NEVER freeze the 60FPS UI thread
+        self._key_queue: "queue.Queue[Optional[Tuple[str, str]]]" = queue.Queue()
+        self._key_worker = threading.Thread(target=self._process_key_queue, daemon=True)
+        self._key_worker.start()
+
         # The soft-keyboard layer is tracked so digits can switch from QWERTY
         # to the symbols/number page and letters can switch back automatically.
         self._keyboard_layer: Optional[str] = None
+
         # Text successfully typed by this desktop Inject bar during the current
         # live-edit session. This lets a later Backspace recover after a partial
         # key-tap failure instead of repeating already-entered characters.
@@ -376,6 +386,7 @@ class AndroidRecordingEngine:
         # 2. Freeze pre-touch state before UI transitions
         self.state_cache.notify_interaction_start()
         self._down_ts = time.perf_counter()
+        self._current_kb_layer = "alpha"
         self._pre_touch_snapshot = self.state_cache.get_snapshot()
         if self._latest_video_frame is not None:
             self._pre_touch_frame = self._latest_video_frame.copy()
@@ -534,68 +545,83 @@ class AndroidRecordingEngine:
             pass
         return max(1, int(self.maatouch.max_x)), max(1, int(self.maatouch.max_y))
 
-    def _load_keyboard_nodes(self):
-        """Cache accessibility nodes in the keyboard region when Gboard exposes them."""
-        if self._keyboard_node_cache is not None:
-            return self._keyboard_node_cache
+    def _load_keyboard_nodes(self, force_fresh: bool = False):
+        """Cache accessibility nodes per keyboard layer ('alpha', 'sym1', 'sym2')."""
+        layer = self._current_kb_layer
+        if not force_fresh and layer in self._keyboard_layer_caches:
+            return self._keyboard_layer_caches[layer]
 
-        try:
-            xml_dump = self.state_cache.u2_dev.dump_hierarchy(compressed=False)
-        except Exception:
-            xml_dump = ""
-        if not xml_dump:
-            # Some keyboard versions do not expose soft keys in the XML. The
-            # coordinate fallback below is designed for that case.
-            self._keyboard_node_cache = []
-            return self._keyboard_node_cache
-        try:
-            root = ET.fromstring(xml_dump.encode("utf-8"))
-        except Exception:
+        xml_dump = None
+        if not force_fresh:
+            _, _, _, xml_dump = self.state_cache.get_snapshot()
+
+        def _parse_nodes(xml_text: str):
+            if not xml_text:
+                return []
             try:
-                root = ET.fromstring(xml_dump)
+                root = ET.fromstring(xml_text.encode("utf-8"))
             except Exception:
-                self._keyboard_node_cache = []
-                return self._keyboard_node_cache
+                root = ET.fromstring(xml_text)
 
-        screen_w, screen_h = self._screen_size_for_keyboard()
-        nodes = []
-        for elem in root.iter("node"):
-            attrs = dict(elem.attrib)
-            match = re.fullmatch(
-                r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", attrs.get("bounds", "")
+            screen_w = max(1, int(self.maatouch.max_x))
+            screen_h = max(1, int(self.maatouch.max_y))
+
+            parsed = []
+            for elem in root.iter("node"):
+                attrs = dict(elem.attrib)
+                match = re.fullmatch(
+                    r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", attrs.get("bounds", "")
+                )
+                if not match:
+                    continue
+                left, top, right, bottom = map(int, match.groups())
+                width, height = right - left, bottom - top
+                if width <= 0 or height <= 0:
+                    continue
+                center_y = (top + bottom) / 2
+                if center_y < screen_h * 0.48 or center_y > screen_h * 0.985:
+                    continue
+                if width > screen_w * 0.85 or height > screen_h * 0.16:
+                    continue
+
+                raw_text = attrs.get("text", "").strip().lower()
+                raw_desc = attrs.get("content-desc", "").strip().lower()
+
+                # CRITICAL FIX: If a key's primary text/desc is a single letter (a-z),
+                # ignore its secondary 'hint' (like '1' on 'q') so numbers don't tap letters!
+                primary_char = raw_text or raw_desc
+                if len(primary_char) == 1 and primary_char.isalpha():
+                    labels = {primary_char}
+                else:
+                    # Also strip comma-separated secondary hints like "q, 1" -> "q"
+                    cleaned_desc = raw_desc.split(",")[0].strip() if "," in raw_desc and len(raw_desc) <= 6 else raw_desc
+                    labels = {raw_text, raw_desc, cleaned_desc}
+                    if not raw_text and not raw_desc:
+                        labels.add(attrs.get("hint", "").strip().lower())
+
+                labels.discard("")
+                parsed.append({
+                    "bounds": (left, top, right, bottom),
+                    "attrs": attrs,
+                    "labels": labels,
+                    "resource_id": attrs.get("resource-id", "").lower(),
+                    "area": width * height,
+                    "clickable_rank": 0 if attrs.get("clickable", "false").lower() == "true" else 1,
+                    "screen_w": screen_w,
+                    "screen_h": screen_h,
+                })
+            return parsed
+
+        nodes = _parse_nodes(xml_dump) if xml_dump else []
+        if len(nodes) < 10 or force_fresh:
+            xml_dump = self.state_cache.u2_dev.dump_hierarchy(compressed=False)
+            nodes = _parse_nodes(xml_dump)
+
+        if not nodes:
+            raise RuntimeError(
+                "No keyboard keys exposed. Ensure a text field is focused and the keyboard is open."
             )
-            if not match:
-                continue
-            left, top, right, bottom = map(int, match.groups())
-            width, height = right - left, bottom - top
-            if width <= 0 or height <= 0:
-                continue
-            center_y = (top + bottom) / 2
-            # Exclude the Android system navigation area at the very bottom.
-            # In particular, its Back arrow must never be mistaken for Gboard Backspace.
-            if center_y < screen_h * 0.50 or center_y > screen_h * 0.955:
-                continue
-            if width > screen_w * 0.80 or height > screen_h * 0.16:
-                continue
-
-            labels = {
-                attrs.get("text", "").strip().lower(),
-                attrs.get("content-desc", "").strip().lower(),
-                attrs.get("hint", "").strip().lower(),
-            }
-            labels.discard("")
-            nodes.append({
-                "bounds": (left, top, right, bottom),
-                "attrs": attrs,
-                "labels": labels,
-                "resource_id": attrs.get("resource-id", "").lower(),
-                "area": width * height,
-                "clickable_rank": 0 if attrs.get("clickable", "false").lower() == "true" else 1,
-                "screen_w": screen_w,
-            })
-
-        self._keyboard_node_cache = nodes
-        self._infer_keyboard_layer_from_nodes(nodes)
+        self._keyboard_layer_caches[layer] = nodes
         return nodes
 
     def _infer_keyboard_layer_from_nodes(self, nodes=None):
@@ -725,19 +751,32 @@ class AndroidRecordingEngine:
         return int(round(x * width)), int(round(y * height))
 
     def _find_keyboard_key(self, key_name: str):
-        """Find a key by accessibility label; return None-like fallback bounds if hidden."""
+        """Resolve a displayed keyboard key on the active layer."""
         semantic = str(key_name).lower()
         aliases = {
-            "shift": {"shift", "shift key", "caps lock", "shift key down", "⇧"},
+            "shift": {"shift", "shift key", "caps lock", "shift key down"},
             "backspace": {
                 "backspace", "backspace key", "delete", "delete key",
-                "erase", "⌫", "backspace/delete",
+                "erase", "⌫", "←", "backspace/delete",
             },
-            "space": {"space", "spacebar", "space bar", " ", "english (us)", "english (india)", "english (uk)"},
-            "symbols_toggle": {"?123", "123?", "symbols", "symbol", "numbers", "number"},
-            "alphabet_toggle": {"abc", "letters", "alphabet"},
-            "symbol_page": {"=\\<", "=</", "more symbols", "symbols 2"},
-            "enter": {"enter", "return", "done", "search", "go", "↵", "⌕"},
+            "space": {
+                "space", "spacebar", "space bar", " ",
+                "english (us)", "english (india)", "english (uk)",
+            },
+            "enter": {
+                "enter", "search", "go", "done", "next", "send", "return", "↵", "🔍",
+            },
+            "sym_switch": {
+                "?123", "123", "!#1", "?12", "sym", "symbols",
+                "symbol", "numbers and symbols", "switch to symbols",
+                "more_symbols", "symbol key",
+            },
+            "alpha_switch": {
+                "abc", "letters", "alphabet", "switch to letters", "alphabetic",
+            },
+            "more_sym_switch": {
+                "=\\<", "~\\<", "1/2", "2/2", "more symbols", "#+=", "{&=",
+            },
         }
         punctuation_names = {
             ",": {",", "comma"}, ".": {".", "dot", "period", "full stop"},
@@ -747,6 +786,12 @@ class AndroidRecordingEngine:
             "?": {"?", "question mark"}, "!": {"!", "exclamation mark"},
             "-": {"-", "hyphen", "minus"}, "=": {"=", "equals", "equal sign"},
             ":": {":", "colon"}, ";": {";", "semicolon"},
+            "@": {"@", "at", "at sign"}, "#": {"#", "hash", "pound"},
+            "$": {"$", "dollar", "dollar sign"}, "₹": {"₹", "rupee"},
+            "%": {"%", "percent"}, "&": {"&", "ampersand"},
+            "*": {"*", "asterisk", "star"}, "(": {"(", "left parenthesis", "open parenthesis"},
+            ")": {")", "right parenthesis", "close parenthesis"},
+            "_": {"_", "underscore"}, "+": {"+", "plus"},
         }
         if semantic in aliases:
             accepted = aliases[semantic]
@@ -756,107 +801,98 @@ class AndroidRecordingEngine:
         else:
             accepted = {semantic}
 
+        nodes = self._load_keyboard_nodes()
         matches = []
-        for node in self._load_keyboard_nodes():
+        for node in nodes:
             found = bool(node["labels"].intersection(accepted))
             resource_id = node["resource_id"]
-            if not found and semantic == "space" and "space" in resource_id:
-                found = True
-            elif not found and semantic == "backspace" and any(token in resource_id for token in ("delete", "backspace", "erase")):
-                found = True
-            elif not found and semantic == "shift" and "shift" in resource_id:
-                found = True
-            elif not found and semantic == "symbols_toggle" and any(token in resource_id for token in ("symbol", "number", "numeric")):
-                found = True
-            elif not found and semantic == "alphabet_toggle" and any(token in resource_id for token in ("abc", "alphabet", "letter")):
-                found = True
+            if not found:
+                if semantic == "space" and "space" in resource_id:
+                    found = True
+                elif semantic == "backspace" and any(
+                    t in resource_id for t in ("delete", "backspace", "erase")
+                ):
+                    found = True
+                elif semantic == "shift" and "shift" in resource_id:
+                    found = True
+                elif semantic in ("sym_switch", "alpha_switch") and any(
+                    t in resource_id for t in ("key_pos_switch", "symbol", "mode_change")
+                ):
+                    found = True
+                elif semantic == "enter" and any(
+                    t in resource_id for t in ("enter", "action")
+                ):
+                    found = True
             if not found:
                 continue
+
             left, top, right, bottom = node["bounds"]
-            node_width, node_height = right - left, bottom - top
+            width, height = right - left, bottom - top
             max_width = node["screen_w"] * (0.80 if semantic == "space" else 0.28)
-            if node_width > max_width or node_height > 0.16 * max(1, int(self._screen_size_for_keyboard()[1])):
+            if width > max_width or height > 0.16 * node["screen_h"]:
                 continue
             matches.append(node)
 
-        if matches:
-            matches.sort(key=lambda node: (node["area"], node["clickable_rank"]))
-            best = matches[0]
-            return best["bounds"], best["attrs"]
+        # Geometric fallback for ?123 / ABC mode switch key (always bottom-left corner of keyboard)
+        if not matches and semantic in ("sym_switch", "alpha_switch") and nodes:
+            bottom_left_candidates = [
+                n for n in nodes
+                if n["bounds"][0] < n["screen_w"] * 0.22
+                and (n["bounds"][1] + n["bounds"][3]) / 2 > n["screen_h"] * 0.84
+            ]
+            if bottom_left_candidates:
+                bottom_left_candidates.sort(key=lambda n: (-n["bounds"][3], n["bounds"][0]))
+                best = bottom_left_candidates[0]
+                return best["bounds"], best["attrs"]
 
-        # If Gboard hides individual soft keys from the accessibility tree, use
-        # a screen-relative point. It is scaled to MaaTouch's raw dimensions below.
-        x, y = self._fallback_key_point(key_name)
-        return (x, y, x + 1, y + 1), {"_coordinate_fallback": "true"}
+        if not matches:
+            raise RuntimeError(f"Key '{key_name}' not found on layer '{self._current_kb_layer}'.")
+
+        matches.sort(key=lambda node: (node["area"], node["clickable_rank"]))
+        best = matches[0]
+        return best["bounds"], best["attrs"]
 
     def _tap_android_keyboard_key(self, key_name: str) -> Dict[str, str]:
-        """Tap one visible Android soft key with MaaTouch (accessibility first, coordinate fallback)."""
+        """Physically tap one visible Android soft-key using batched MaaTouch."""
         bounds, attrs = self._find_keyboard_key(key_name)
         left, top, right, bottom = bounds
-        logical_x = int((left + right) / 2)
-        logical_y = int((top + bottom) / 2)
-        screen_w, screen_h = self._screen_size_for_keyboard()
-        x = int(round(logical_x * self.maatouch.max_x / max(1, screen_w)))
-        y = int(round(logical_y * self.maatouch.max_y / max(1, screen_h)))
-        x = max(0, min(self.maatouch.max_x - 1, x))
-        y = max(0, min(self.maatouch.max_y - 1, y))
+        x = int((left + right) / 2)
+        y = int((top + bottom) / 2)
         pressure = max(1, min(int(self.maatouch.max_pressure), 75))
-        self.maatouch.touch_down(0, x, y, pressure)
-        time.sleep(0.070)
-        self.maatouch.touch_up(0)
-        time.sleep(0.020)
 
-        semantic = str(key_name).lower()
-        # Gboard changes its suggestion strip while typing; never reuse old bounds.
-        self._keyboard_node_cache = None
-        if semantic in {"shift", "symbols_toggle", "alphabet_toggle", "symbol_page", "?123", "abc"}:
-            if semantic == "shift":
-                self._keyboard_shift_state = None
-            elif semantic in {"symbols_toggle", "?123"}:
-                self._keyboard_layer = "symbols"
-            elif semantic in {"alphabet_toggle", "abc"}:
-                self._keyboard_layer = "alpha"
-            elif semantic == "symbol_page":
-                self._keyboard_layer = "symbols2"
+        # Fast 18ms tap for snappy real-time visual feedback
+        self.maatouch._send(f"d 0 {x} {y} {pressure}\nc\nw 18\nu 0\nc\n")
+        time.sleep(0.022)
         return attrs
 
-    def _ensure_keyboard_layer(self, desired: str):
-        """Switch between QWERTY and the numbers/symbols layer when necessary."""
-        if desired not in {"alpha", "symbols", "symbols2"}:
-            return
-        nodes = self._load_keyboard_nodes()
-        self._infer_keyboard_layer_from_nodes(nodes)
-        current = self._keyboard_layer or "alpha"
-        if desired == current:
-            return
-        if desired == "symbols2":
-            if current == "alpha":
-                self._tap_android_keyboard_key("symbols_toggle")
-                current = "symbols"
-            if current == "symbols":
-                # Gboard's second-symbol-page button commonly appears as =\\<.
-                try:
-                    self._tap_android_keyboard_key("symbol_page")
-                except Exception:
-                    # Coordinate fallback is still attempted by the key helper;
-                    # propagate only if the keyboard geometry is not usable.
-                    raise
-            self._keyboard_layer = "symbols2"
-            self._keyboard_node_cache = None
+    def _switch_keyboard_layer(self, target_layer: str):
+        """Navigate between 'alpha' (ABC), 'sym1' (?123), and 'sym2'."""
+        if self._current_kb_layer == target_layer:
             return
 
-        if desired == "symbols" and current == "alpha":
-            self._tap_android_keyboard_key("symbols_toggle")
-        elif desired == "symbols" and current == "symbols2":
-            # Gboard's second page returns to QWERTY through ABC; tap ?123 again
-            # to reach the number row on symbols page 1.
-            self._tap_android_keyboard_key("alphabet_toggle")
-            self._tap_android_keyboard_key("symbols_toggle")
-        elif desired == "alpha" and current != "alpha":
-            self._tap_android_keyboard_key("alphabet_toggle")
-        self._keyboard_layer = desired
-        self._keyboard_shift_state = None
-        self._keyboard_node_cache = None
+        if target_layer == "alpha":
+            self._tap_android_keyboard_key("alpha_switch")
+            self._current_kb_layer = "alpha"
+            
+        elif target_layer == "sym1":
+            if self._current_kb_layer == "alpha":
+                self._tap_android_keyboard_key("sym_switch")
+            elif self._current_kb_layer == "sym2":
+                # Tapping the switch key on sym2 usually toggles back to sym1 (?123)
+                self._tap_android_keyboard_key("sym_switch") 
+            self._current_kb_layer = "sym1"
+            
+        elif target_layer == "sym2":
+            if self._current_kb_layer == "alpha":
+                self._tap_android_keyboard_key("sym_switch")
+                time.sleep(0.14) # Wait for sym1 to animate before tapping again
+            self._tap_android_keyboard_key("more_sym_switch")
+            self._current_kb_layer = "sym2"
+
+        # Cache the new layer instantly if we haven't seen it yet
+        if target_layer not in self._keyboard_layer_caches:
+            time.sleep(0.14)
+            self._load_keyboard_nodes(force_fresh=True)
 
     def _keyboard_shift_is_active(self):
         """Read Shift state when the keyboard exposes it."""
@@ -889,101 +925,90 @@ class AndroidRecordingEngine:
         self._keyboard_shift_state = desired
 
     def _tap_keyboard_character(self, character: str):
-        """Type one character using visible Gboard key taps and explicit layouts."""
+        """Enter one character, searching across alpha, sym1, and sym2 layers."""
         if character == " ":
-            self._ensure_keyboard_layer("alpha")
             self._tap_android_keyboard_key("space")
-            self._keyboard_shift_state = None
+            if self._current_kb_layer != "alpha":
+                self._current_kb_layer = "alpha"
             return
+
         if character in "\r\n":
             self._tap_android_keyboard_key("enter")
             return
 
+        # 1. Standard letters (a-z, A-Z)
         if character.isalpha():
-            self._ensure_keyboard_layer("alpha")
+            if self._current_kb_layer != "alpha":
+                self._switch_keyboard_layer("alpha")
             needs_shift = character.isupper()
             self._ensure_keyboard_shift(needs_shift)
             self._tap_android_keyboard_key(character.lower())
-            # Gboard normally releases one-shot Shift after a character.
             self._keyboard_shift_state = False
             return
 
-        # Digits must switch layouts BEFORE looking for a key named "1" etc.
-        # On QWERTY, these may also appear as small secondary labels above letters.
-        if character in "0123456789":
-            self._ensure_keyboard_layer("symbols")
+        # 2. Common punctuation visible directly on the 'alpha' layer (.,)
+        if self._current_kb_layer == "alpha" and character in (".", ","):
+            try:
+                self._tap_android_keyboard_key(character)
+                return
+            except Exception:
+                pass
+
+        # 3. Numbers and Primary Symbols -> Switch to '?123' ('sym1') layer
+        if self._current_kb_layer == "alpha":
+            self._switch_keyboard_layer("sym1")
+
+        try:
             self._tap_android_keyboard_key(character)
             return
+        except Exception:
+            pass # Not on sym1, move to sym2
 
-        # Symbols visible on Gboard's first symbols page.
-        page1_symbols = set("@#₹_&-+()/;:'\"!?*.,")
-        if character in page1_symbols:
-            self._ensure_keyboard_layer("symbols")
-            self._tap_android_keyboard_key(character)
-            self._keyboard_shift_state = None
-            return
-
-        # Symbols from Gboard's second page (including dollar, brackets and braces).
-        page2_symbols = set("~`|•√π÷×§Δ€¥$¢^°−{}\\%©®™✓[]")
-        if character in page2_symbols:
-            self._ensure_keyboard_layer("symbols2")
-            self._tap_android_keyboard_key(character)
-            self._keyboard_shift_state = None
-            return
-
-        # Last attempt: use a key directly exposed by the current accessibility tree.
-        # Do not silently substitute another key if it cannot be found.
-        bounds, attrs = self._find_keyboard_key(character)
-        if attrs.get("_coordinate_fallback") != "true":
+        # 4. Secondary Symbols -> Switch to '=\<' ('sym2') layer
+        try:
+            self._switch_keyboard_layer("sym2")
             self._tap_android_keyboard_key(character)
             return
+        except Exception:
+            # Absolute fallback: clear cache and try one last time
+            self._load_keyboard_nodes(force_fresh=True)
+            self._tap_android_keyboard_key(character)
 
-        raise RuntimeError(
-            f"Character {character!r} is not mapped for the current Gboard layout. "
-            "Keep the phone in portrait mode with Gboard visible."
-        )
-
-    def on_viewport_text_edit(self, previous_text: str, current_text: str) -> bool:
-        """Mirror desktop edits live; deletion uses visible Backspace taps.
-
-        `previous_text` is retained for compatibility with the UI callback. The
-        engine's own successfully mirrored text is the source of truth, so a
-        partial failure does not cause already-tapped keys to be repeated.
-        """
+    def on_viewport_text_edit(
+        self,
+        previous_text: str,
+        current_text: str,
+    ) -> bool:
+        """Non-blocking live mirror: queues key taps on a background thread."""
+        previous_text = str(previous_text)
         current_text = str(current_text)
-        mirrored = str(self._live_phone_text)
-        if mirrored == current_text:
+
+        if previous_text == current_text:
             return True
 
         if current_text and self._live_text_started_at is None:
             self._live_text_started_at = time.perf_counter()
 
-        common_length = min(len(mirrored), len(current_text))
+        common_length = min(len(previous_text), len(current_text))
         prefix_length = 0
-        while prefix_length < common_length and mirrored[prefix_length] == current_text[prefix_length]:
+        while (
+            prefix_length < common_length
+            and previous_text[prefix_length] == current_text[prefix_length]
+        ):
             prefix_length += 1
 
-        delete_count = len(mirrored) - prefix_length
+        delete_count = len(previous_text) - prefix_length
         replacement = current_text[prefix_length:]
 
         self.state_cache.notify_interaction_start()
-        try:
-            for _ in range(delete_count):
-                self._tap_android_keyboard_key("backspace")
-                self._live_phone_text = self._live_phone_text[:-1]
-
-            for character in replacement:
-                self._tap_keyboard_character(character)
-                self._live_phone_text += character
-
-        except Exception as exc:
-            print(f"[!] Live text synchronization failed after {len(self._live_phone_text)} mirrored characters: {exc}")
-            return False
-        finally:
-            self.state_cache.notify_interaction_end()
+        for _ in range(delete_count):
+            self._key_queue.put(("backspace", ""))
+        for character in replacement:
+            self._key_queue.put(("char", character))
 
         if not current_text:
             self._live_text_started_at = None
+
         return True
 
     def on_viewport_text_input(
@@ -991,21 +1016,9 @@ class AndroidRecordingEngine:
         text: str,
         already_injected: bool = False,
     ) -> bool:
-        """Record a finished text action, optionally without reinjecting it.
-
-        When ``already_injected`` is True, the desktop bar has already mirrored
-        the text to the phone character-by-character, so this method only
-        records the semantic action in the JSON.
-        """
         payload = str(text)
         if not payload.strip():
             return False
-
-        # A final catch-up attempt prevents an immediately pressed Enter/Inject
-        # from recording text that the keyboard did not finish receiving.
-        if already_injected and self._live_phone_text != payload:
-            if not self.on_viewport_text_edit(self._live_phone_text, payload):
-                return False
 
         action_started_at = (
             self._live_text_started_at
@@ -1017,20 +1030,11 @@ class AndroidRecordingEngine:
             int((action_started_at - self._last_step_end_ts) * 1000),
         )
 
-        self.state_cache.notify_interaction_start()
-        try:
-            pkg, act, orient, _ = self.state_cache.get_snapshot()
+        pkg, act, orient, _ = self.state_cache.get_snapshot()
 
-            if not already_injected:
-                for character in payload:
-                    self._tap_keyboard_character(character)
-
-        except Exception as exc:
-            print(f"[!] Phone text injection failed: {exc}")
-            return False
-
-        finally:
-            self.state_cache.notify_interaction_end()
+        if not already_injected:
+            for character in payload:
+                self._key_queue.put(("char", character))
 
         self._step_counter += 1
         self.steps.append(
@@ -1048,16 +1052,7 @@ class AndroidRecordingEngine:
 
         self._last_step_end_ts = time.perf_counter()
         self._live_text_started_at = None
-        # The desktop bar is cleared after an Inject/Enter action. A later new
-        # desktop entry should append to the current phone field, not backspace
-        # the already-recorded text from the prior action.
-        self._live_phone_text = ""
-        self._keyboard_node_cache = None
-
-        print(
-            f"[+] Recorded TEXT_INPUT (step #{self._step_counter}, "
-            f"{len(payload)} characters)"
-        )
+        print(f"[+] Recorded TEXT_INPUT (step #{self._step_counter}, {len(payload)} chars)")
         return True
 
     # -----------------------------------------------------------------
@@ -1104,3 +1099,21 @@ class AndroidRecordingEngine:
         out_file = self.output_dir / "recording.json"
         out_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return out_file
+
+    def _process_key_queue(self):
+        """Background consumer that taps soft-keys without blocking the Qt UI video loop."""
+        while True:
+            item = self._key_queue.get()
+            if item is None:
+                self._key_queue.task_done()
+                break
+            action, value = item
+            try:
+                if action == "backspace":
+                    self._tap_android_keyboard_key("backspace")
+                elif action == "char":
+                    self._tap_keyboard_character(value)
+            except Exception as exc:
+                print(f"[!] Live key tap warning ({value!r}): {exc}")
+            finally:
+                self._key_queue.task_done()
