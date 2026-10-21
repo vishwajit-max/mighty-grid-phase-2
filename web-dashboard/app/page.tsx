@@ -151,11 +151,15 @@ export default function MightyGridStudio() {
     if (isFetchingRef.current) return;
     isFetchingRef.current = true;
     setIsScanning(true);
+
+    // Generate a timestamp to completely bust the browser GET cache
+    const cacheBuster = `?t=${Date.now()}`;
+
     try {
       const [devRes, perRes, recRes] = await Promise.all([
-        fetch(`${API_BASE}/api/devices`).then((r) => r.json()),
-        fetch(`${API_BASE}/api/personas`).then((r) => r.json()),
-        fetch(`${API_BASE}/api/recordings`).then((r) => r.json()),
+        fetch(`${API_BASE}/api/devices${cacheBuster}`, { cache: "no-store" }).then((r) => r.json()),
+        fetch(`${API_BASE}/api/personas${cacheBuster}`, { cache: "no-store" }).then((r) => r.json()),
+        fetch(`${API_BASE}/api/recordings${cacheBuster}`, { cache: "no-store" }).then((r) => r.json()),
       ]);
 
       const fetchedDevs: Device[] = devRes.devices || [];
@@ -167,7 +171,9 @@ export default function MightyGridStudio() {
 
       const recs: Recording[] = recRes.recordings || [];
       setRecordings(recs);
-      if (recs.length > 0 && !selectedRecording) {
+      
+      // Auto-select the newest recording if the list isn't empty
+      if (recs.length > 0) {
         setSelectedRecording(recs[0].path);
       }
     } catch {

@@ -6,6 +6,7 @@ import random
 import sys
 import time
 import threading
+import re
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -406,6 +407,216 @@ def dismiss_oem_system_dialogs(
 
     return False
 
+# =====================================================================
+# 2.A. PHYSICAL KEYBOARD INJECTOR FOR REPLAY
+# =====================================================================
+
+class PhysicalKeyboardInjector:
+    def __init__(self, u2_dev, maatouch):
+        self.u2_dev = u2_dev
+        self.maatouch = maatouch
+        self._current_kb_layer = "alpha"
+        self._keyboard_layer_caches = {}
+        self._keyboard_shift_state = None
+
+    def _load_keyboard_nodes(self, force_fresh=False):
+        layer = self._current_kb_layer
+        if not force_fresh and layer in self._keyboard_layer_caches:
+            return self._keyboard_layer_caches[layer]
+
+        xml_dump = self.u2_dev.dump_hierarchy(compressed=False)
+        try:
+            root = ET.fromstring(xml_dump.encode("utf-8"))
+        except Exception:
+            root = ET.fromstring(xml_dump)
+
+        screen_w = max(1, int(self.maatouch.max_x))
+        screen_h = max(1, int(self.maatouch.max_y))
+
+        parsed = []
+        for elem in root.iter("node"):
+            attrs = dict(elem.attrib)
+            match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", attrs.get("bounds", ""))
+            if not match: continue
+            l, t, r, b = map(int, match.groups())
+            w, h = r - l, b - t
+            if w <= 0 or h <= 0: continue
+            cy = (t + b) / 2
+            if cy < screen_h * 0.48 or cy > screen_h * 0.985: continue
+            if w > screen_w * 0.85 or h > screen_h * 0.16: continue
+
+            raw_text = attrs.get("text", "").strip().lower()
+            raw_desc = attrs.get("content-desc", "").strip().lower()
+
+            primary_char = raw_text or raw_desc
+            if len(primary_char) == 1 and primary_char.isalpha():
+                labels = {primary_char}
+            else:
+                cleaned_desc = raw_desc.split(",")[0].strip() if "," in raw_desc and len(raw_desc) <= 6 else raw_desc
+                labels = {raw_text, raw_desc, cleaned_desc}
+                if not raw_text and not raw_desc:
+                    labels.add(attrs.get("hint", "").strip().lower())
+            labels.discard("")
+
+            parsed.append({
+                "bounds": (l, t, r, b),
+                "attrs": attrs,
+                "labels": labels,
+                "resource_id": attrs.get("resource-id", "").lower(),
+                "area": w * h,
+                "clickable_rank": 0 if attrs.get("clickable", "false").lower() == "true" else 1,
+                "screen_w": screen_w,
+                "screen_h": screen_h,
+            })
+
+        if not parsed:
+            raise RuntimeError("No keyboard keys exposed. Ensure keyboard is open.")
+        self._keyboard_layer_caches[layer] = parsed
+        return parsed
+
+    def _find_keyboard_key(self, key_name: str):
+        semantic = str(key_name).lower()
+        aliases = {
+            "shift": {"shift", "shift key", "caps lock"},
+            "backspace": {"backspace", "delete", "erase", "⌫", "←", "backspace/delete"},
+            "space": {"space", "spacebar", " ", "english (us)", "english (india)"},
+            "enter": {"enter", "search", "go", "done", "next", "send", "return", "↵", "🔍"},
+            "sym_switch": {"?123", "123", "!#1", "?12", "sym", "symbols"},
+            "alpha_switch": {"abc", "letters", "alphabet"},
+            "more_sym_switch": {"=\\<", "~\\<", "1/2", "2/2", "#+=", "{&="},
+        }
+        punctuation_names = {
+            ",": {",", "comma"}, ".": {".", "dot", "period"},
+            "/": {"/", "slash"}, "\\": {"\\", "backslash"},
+            "'": {"'", "apostrophe"}, '"': {'"', "double quote"},
+            "?": {"?", "question mark"}, "!": {"!", "exclamation mark"},
+            "-": {"-", "hyphen"}, "=": {"=", "equals"},
+            ":": {":", "colon"}, ";": {";", "semicolon"},
+            "@": {"@", "at"}, "#": {"#", "hash"},
+            "$": {"$", "dollar"}, "₹": {"₹", "rupee"},
+            "%": {"%", "percent"}, "&": {"&", "ampersand"},
+            "*": {"*", "asterisk"}, "(": {"(", "left parenthesis"},
+            ")": {")", "right parenthesis"}, "_": {"_", "underscore"}, "+": {"+", "plus"},
+        }
+        if semantic in aliases: accepted = aliases[semantic]
+        elif len(key_name) == 1:
+            accepted = {semantic}
+            accepted.update(punctuation_names.get(key_name, set()))
+        else: accepted = {semantic}
+
+        nodes = self._load_keyboard_nodes()
+        matches = []
+        for node in nodes:
+            found = bool(node["labels"].intersection(accepted))
+            rid = node["resource_id"]
+            if not found:
+                if semantic == "space" and "space" in rid: found = True
+                elif semantic == "backspace" and any(t in rid for t in ("delete", "backspace")): found = True
+                elif semantic == "shift" and "shift" in rid: found = True
+                elif semantic in ("sym_switch", "alpha_switch") and any(t in rid for t in ("key_pos_switch", "symbol", "mode_change")): found = True
+                elif semantic == "enter" and any(t in rid for t in ("enter", "action")): found = True
+            if not found: continue
+
+            l, t, r, b = node["bounds"]
+            w, h = r - l, b - t
+            if w > node["screen_w"] * (0.80 if semantic == "space" else 0.28) or h > 0.16 * node["screen_h"]: continue
+            matches.append(node)
+
+        if not matches and semantic in ("sym_switch", "alpha_switch") and nodes:
+            bl_cands = [n for n in nodes if n["bounds"][0] < n["screen_w"]*0.22 and (n["bounds"][1]+n["bounds"][3])/2 > n["screen_h"]*0.84]
+            if bl_cands:
+                bl_cands.sort(key=lambda n: (-n["bounds"][3], n["bounds"][0]))
+                return bl_cands[0]["bounds"], bl_cands[0]["attrs"]
+
+        if not matches:
+            raise RuntimeError(f"Key '{key_name}' not found on layer '{self._current_kb_layer}'.")
+        matches.sort(key=lambda n: (n["area"], n["clickable_rank"]))
+        return matches[0]["bounds"], matches[0]["attrs"]
+
+    def _tap_android_keyboard_key(self, key_name: str):
+        bounds, attrs = self._find_keyboard_key(key_name)
+        l, t, r, b = bounds
+        x, y = int((l + r) / 2), int((t + b) / 2)
+        pressure = max(1, min(int(self.maatouch.max_pressure), 75))
+        # Ensure we write a clean, atomic MaaTouch command batch so it never hangs
+        self.maatouch._send(f"d 0 {x} {y} {pressure}\nc\nw 22\nu 0\nc\n")
+        time.sleep(0.025)
+        return attrs
+
+    def _switch_keyboard_layer(self, target_layer: str):
+        if self._current_kb_layer == target_layer: return
+        if target_layer == "alpha":
+            self._tap_android_keyboard_key("alpha_switch")
+            self._current_kb_layer = "alpha"
+        elif target_layer == "sym1":
+            if self._current_kb_layer == "alpha": self._tap_android_keyboard_key("sym_switch")
+            elif self._current_kb_layer == "sym2": self._tap_android_keyboard_key("sym_switch")
+            self._current_kb_layer = "sym1"
+        elif target_layer == "sym2":
+            if self._current_kb_layer == "alpha":
+                self._tap_android_keyboard_key("sym_switch")
+                time.sleep(0.14)
+            self._tap_android_keyboard_key("more_sym_switch")
+            self._current_kb_layer = "sym2"
+
+        if target_layer not in self._keyboard_layer_caches:
+            time.sleep(0.14)
+            self._load_keyboard_nodes(force_fresh=True)
+
+    def _keyboard_shift_is_active(self):
+        if self._keyboard_shift_state is not None: return self._keyboard_shift_state
+        try: _, attrs = self._find_keyboard_key("shift")
+        except Exception: return None
+        vals = [attrs.get(n, "").strip().lower() for n in ("selected", "checked", "activated")]
+        if any(v in ("true", "1") for v in vals): self._keyboard_shift_state = True
+        elif any(v in ("false", "0") for v in vals): self._keyboard_shift_state = False
+        else: return None
+        return self._keyboard_shift_state
+
+    def _ensure_keyboard_shift(self, desired: bool):
+        active = self._keyboard_shift_is_active()
+        if active is None:
+            if desired: self._tap_android_keyboard_key("shift")
+            self._keyboard_shift_state = desired
+            return
+        if active != desired: self._tap_android_keyboard_key("shift")
+        self._keyboard_shift_state = desired
+
+    def _tap_keyboard_character(self, character: str):
+        if character == " ":
+            self._tap_android_keyboard_key("space")
+            if self._current_kb_layer != "alpha": self._current_kb_layer = "alpha"
+            return
+        if character in "\r\n":
+            self._tap_android_keyboard_key("enter")
+            return
+
+        if character.isalpha():
+            if self._current_kb_layer != "alpha": self._switch_keyboard_layer("alpha")
+            self._ensure_keyboard_shift(character.isupper())
+            self._tap_android_keyboard_key(character.lower())
+            self._keyboard_shift_state = False
+            return
+
+        if self._current_kb_layer == "alpha" and character in (".", ","):
+            try:
+                self._tap_android_keyboard_key(character)
+                return
+            except Exception: pass
+
+        if self._current_kb_layer == "alpha": self._switch_keyboard_layer("sym1")
+        try:
+            self._tap_android_keyboard_key(character)
+            return
+        except Exception: pass
+
+        try:
+            self._switch_keyboard_layer("sym2")
+            self._tap_android_keyboard_key(character)
+            return
+        except Exception:
+            self._load_keyboard_nodes(force_fresh=True)
+            self._tap_android_keyboard_key(character)
 
 # =====================================================================
 # 2. SINGLE-DEVICE REPLAY WORKER
@@ -527,6 +738,9 @@ class DeviceReplayWorker:
 
                 if step_result["status"] == "FAILED":
                     break
+
+            # NEW: Let the final touch_up command fully flush to Android before severing the pipe
+            time.sleep(0.5)
 
         finally:
             self.maatouch.stop()
@@ -685,20 +899,49 @@ class DeviceReplayWorker:
                 }
 
             try:
-                # Replay the recorded semantic text action. The relevant
-                # phone input field must already be focused.
-                self.u2_dev.send_keys(
-                    payload,
-                    clear=False,
-                )
+                # 1. Initialize the physical keyboard injector once for this device run
+                if not hasattr(self, "kb_injector"):
+                    self.kb_injector = PhysicalKeyboardInjector(self.u2_dev, self.maatouch)
+
+                # 2. Calculate Persona Timing Dynamics
+                safe_wpm = max(1.0, float(getattr(self.persona, "wpm", 40.0)))
+                base_interval = (12.0 / safe_wpm) * self.timing_scale
+                burstiness = max(1.0, float(getattr(self.persona, "burstiness", 1.0)))
+                variation = min(0.30, max(0.0, (burstiness - 1.0) * 0.18))
+                
+                schedule_seed = int(getattr(self.persona, "seed", 0)) + int(step_id) * 104729
+                rng = random.Random(schedule_seed)
+
+                completed_chars = 0
+                started_at = time.perf_counter()
+
+                # 3. Physically tap the screen for each character
+                for index, character in enumerate(payload):
+                    self.kb_injector._tap_keyboard_character(character)
+                    completed_chars += 1
+                    
+                    if index < len(payload) - 1:
+                        factor = rng.uniform(1.0 - variation, 1.0 + variation)
+                        if character == " ": factor *= 1.12
+                        elif character in ",;:": factor *= 1.35
+                        elif character in ".!?": factor *= 1.65
+                        
+                        # Subtract the ~25ms physical tap duration from the sleep
+                        sleep_time = max(0.015, base_interval * factor)
+                        adjusted_sleep = max(0.001, sleep_time - 0.025)
+                        time.sleep(adjusted_sleep)
+
+                elapsed = time.perf_counter() - started_at
 
                 return {
                     "step_id": step_id,
                     "type": event_type,
                     "status": "PASSED",
                     "text_input": {
-                        "method": "uiautomator2.send_keys",
-                        "characters": len(payload),
+                        "method": "maatouch_physical_typing",
+                        "characters": completed_chars,
+                        "elapsed_seconds": round(elapsed, 3),
+                        "wpm_achieved": round((completed_chars / 5.0) / (elapsed / 60.0), 1) if elapsed > 0 else 0
                     },
                 }
 
@@ -707,7 +950,7 @@ class DeviceReplayWorker:
                     "step_id": step_id,
                     "type": event_type,
                     "status": "FAILED",
-                    "reason": f"Text injection failed: {exc}",
+                    "reason": f"Physical text injection failed: {exc}",
                 }
 
         trajectory = step.get("trajectory") or []
@@ -809,62 +1052,40 @@ class DeviceReplayWorker:
             first_sample.get("ry", 0.5),
         )
 
-        extra_scrolls_left = (
-            min(5, self.persona.retry_budget)
-            if scroll_recovery_trajectory
-            else 0
-        )
+        # Give it a generous buffer of extra scrolls to search deep app drawers
+        extra_scrolls_left = 7 if scroll_recovery_trajectory else 0
+        screen_start_time = time.perf_counter()
 
         while time.perf_counter() < deadline:
             dismiss_oem_system_dialogs(self.u2_dev)
 
             if has_semantic_id:
-                bounds = self._find_bounds_in_hierarchy(
-                    anchor,
-                    expected_norm_xy,
-                )
-
+                bounds = self._find_bounds_in_hierarchy(anchor, expected_norm_xy)
                 if bounds:
                     left, top, right, bottom = bounds
-
                     rx = anchor.get("element_rx", 0.5)
                     ry = anchor.get("element_ry", 0.5)
-
-                    hit_x = int(
-                        left + rx * max(1, right - left)
-                    )
-                    hit_y = int(
-                        top + ry * max(1, bottom - top)
-                    )
-
-                    return (
-                        hit_x,
-                        hit_y,
-                    ), "TIER1_UI_ANCHOR"
+                    hit_x = int(left + rx * max(1, right - left))
+                    hit_y = int(top + ry * max(1, bottom - top))
+                    return (hit_x, hit_y), "TIER1_UI_ANCHOR"
 
             crop_relative = anchor.get("visual_crop_path")
-
             if crop_relative:
                 crop_full = self.recording_dir / crop_relative
-
                 if crop_full.exists():
-                    visual_hit = self._match_template_multiscale(
-                        crop_full
-                    )
-
+                    visual_hit = self._match_template_multiscale(crop_full)
                     if visual_hit:
                         return visual_hit, "TIER2_VISUAL_TEMPLATE"
 
-            if (
-                extra_scrolls_left > 0
-                and scroll_recovery_trajectory
-            ):
+            # SMART SCROLL RECOVERY: Wait 1.2s for UI to settle before scrolling
+            time_on_screen = time.perf_counter() - screen_start_time
+            if time_on_screen > 1.2 and extra_scrolls_left > 0 and scroll_recovery_trajectory:
                 extra_scrolls_left -= 1
-
                 width = self.maatouch.max_x
                 height = self.maatouch.max_y
                 first_point = scroll_recovery_trajectory[0]
 
+                print(f"[*] Target not found, triggering auto-scroll recovery ({extra_scrolls_left} left)...")
                 self._inject_scaled_trajectory(
                     int(first_point["rx"] * width),
                     int(first_point["ry"] * height),
@@ -872,8 +1093,10 @@ class DeviceReplayWorker:
                     gesture_type="SWIPE",
                 )
 
-                deadline += 1.4
-                time.sleep(0.55)
+                # Reset the screen timer and extend the total deadline so it has time to look
+                screen_start_time = time.perf_counter()
+                deadline += 2.0
+                time.sleep(0.8) # Allow scroll momentum to settle
                 continue
 
             if not has_semantic_id:
@@ -884,16 +1107,10 @@ class DeviceReplayWorker:
         if anchor.get("text") or anchor.get("content_desc"):
             return None, "NOT_FOUND"
 
-        width = self.maatouch.max_x
-        height = self.maatouch.max_y
+        fallback_x = int(first_sample["rx"] * self.maatouch.max_x)
+        fallback_y = int(first_sample["ry"] * self.maatouch.max_y)
 
-        fallback_x = int(first_sample["rx"] * width)
-        fallback_y = int(first_sample["ry"] * height)
-
-        return (
-            fallback_x,
-            fallback_y,
-        ), "TIER3_NORMALIZED_XY"
+        return (fallback_x, fallback_y), "TIER3_NORMALIZED_XY"
 
     def _find_bounds_in_hierarchy(
         self,
@@ -1330,6 +1547,10 @@ class DeviceReplayWorker:
                     * self.timing_scale
                 ),
             )
+
+            # Strictly cap TAP duration so it never triggers Android's Long Press (500ms bounds)
+            if gesture_type == "TAP":
+                duration_ms = min(duration_ms, 150)
 
             pressure = pressure_at(0.5)
 

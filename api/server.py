@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -287,6 +288,10 @@ async def start_recorder(req: RecordRequest):
 
     def _watch_recorder():
         proc.wait()
+        
+        # Give the OS 500ms to flush the session directory and recording.json to disk
+        time.sleep(0.5)
+        
         with STATE_LOCK:
             ACTIVE_STATE["recorder_proc"] = None
         asyncio.run_coroutine_threadsafe(broadcaster.broadcast("__STATUS__:IDLE"), loop)
