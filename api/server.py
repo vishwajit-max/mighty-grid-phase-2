@@ -96,6 +96,8 @@ async def on_startup():
 
 @app.websocket("/ws/logs")
 async def websocket_logs(ws: WebSocket):
+    if not broadcaster.loop:
+        broadcaster.loop = asyncio.get_running_loop()
     await broadcaster.connect(ws)
     await ws.send_json({"type": "log", "message": "[*] Connected to MightyGrid Telemetry Stream."})
     try:
@@ -397,9 +399,11 @@ async def start_replay(req: ReplayRequest):
             with STATE_LOCK:
                 ACTIVE_STATE["replay_proc"] = proc
 
-            for line in iter(proc.stdout.readline, ""):
-                if line.strip():
-                    print(line.rstrip())
+            # LogBroadcaster will automatically intercept this print and route it to the UI
+            for line in proc.stdout:
+                msg = line.strip()
+                if msg:
+                    print(msg)
 
             proc.wait()
 

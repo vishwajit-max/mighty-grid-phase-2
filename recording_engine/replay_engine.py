@@ -380,33 +380,6 @@ OEM_ALLOW_PATTERNS = [
 ]
 
 
-def dismiss_oem_system_dialogs(
-    u2_dev: u2.Device,
-) -> bool:
-    """Try to dismiss recognized system permission/security dialogs."""
-    try:
-        current_package = (
-            u2_dev.app_current().get("package", "")
-        )
-
-        if (
-            "permissioncontroller" in current_package
-            or "securitycenter" in current_package
-            or "packageinstaller" in current_package
-        ):
-            for label in OEM_ALLOW_PATTERNS:
-                button = u2_dev(textContains=label)
-
-                if button.exists:
-                    button.click()
-                    time.sleep(0.4)
-                    return True
-
-    except Exception:
-        pass
-
-    return False
-
 # =====================================================================
 # 2.A. PHYSICAL KEYBOARD INJECTOR FOR REPLAY
 # =====================================================================
@@ -1057,11 +1030,17 @@ class DeviceReplayWorker:
         screen_start_time = time.perf_counter()
 
         while time.perf_counter() < deadline:
-            dismiss_oem_system_dialogs(self.u2_dev)
-
             if has_semantic_id:
                 bounds = self._find_bounds_in_hierarchy(anchor, expected_norm_xy)
-                if bounds:
+                
+                # If a popup was killed, extend the deadline to survive chained popups
+                if bounds == (-1, -1, -1, -1):
+                    deadline += 2.0
+                    screen_start_time = time.perf_counter()
+                    time.sleep(0.5)  # Let the Android popup fade animation finish
+                    continue
+                    
+                elif bounds:
                     left, top, right, bottom = bounds
                     rx = anchor.get("element_rx", 0.5)
                     ry = anchor.get("element_ry", 0.5)
@@ -1130,6 +1109,70 @@ class DeviceReplayWorker:
         target_text = anchor.get("text", "").strip()
         target_desc = anchor.get("content_desc", "").strip()
         target_class = anchor.get("class_name", "").strip()
+
+        # -------------------------------------------------------------
+        # ZERO-LATENCY POPUP KILLER (Priority-Aware)
+        # Scans the XML we already downloaded in 0ms. Prioritizes
+        # Positive (Agree/Allow) actions over Negative (Cancel/Deny).
+        # -------------------------------------------------------------
+        POSITIVE_PATTERNS = {
+            "allow", "only this time", "while using the app", "got it",
+            "continue", "install anyway", "ok", "agree", "accept"
+        }
+        NEGATIVE_PATTERNS = {
+            "dismiss", "close", "not now", "later", "skip", "no thanks",
+            "don't allow", "deny", "cancel"
+        }
+
+        found_popups = []
+
+        for element in root.iter("node"):
+            if element.attrib.get("clickable", "false").lower() != "true":
+                continue
+
+            text = element.attrib.get("text", "").strip().lower()
+            desc = element.attrib.get("content-desc", "").strip().lower()
+            label = text or desc
+
+            if label in POSITIVE_PATTERNS or label in NEGATIVE_PATTERNS:
+                # Ensure we don't accidentally kill our actual intended target
+                is_target = False
+                if target_text and target_text.lower() in (text, desc):
+                    is_target = True
+                if target_desc and target_desc.lower() in (text, desc):
+                    is_target = True
+                
+                rid = element.attrib.get("resource-id", "").strip().lower()
+                if target_rid and target_rid.lower() == rid:
+                    is_target = True
+
+                if not is_target:
+                    bounds_string = element.attrib.get("bounds", "")
+                    if bounds_string:
+                        parts = bounds_string.replace("][", ",").strip("[]").split(",")
+                        try:
+                            l, t, r, b = map(int, parts)
+                            cx, cy = (l + r) // 2, (t + b) // 2
+                            
+                            # Rank 1 for Positive, Rank 2 for Negative
+                            priority = 1 if label in POSITIVE_PATTERNS else 2
+                            found_popups.append((priority, label, cx, cy))
+                        except ValueError:
+                            pass
+
+        if found_popups:
+            # Sort by priority so 'Agree' (1) beats 'Cancel' (2)
+            found_popups.sort(key=lambda x: x[0])
+            best_popup = found_popups[0]
+            label, cx, cy = best_popup[1], best_popup[2], best_popup[3]
+            
+            print(f"[*] Zero-latency popup intercepted & dismissed: '{label}'")
+            # Dismiss instantly via MaaTouch pipe
+            self.maatouch._send(f"d 0 {cx} {cy} 50\nc\nw 25\nu 0\nc\n")
+            
+            # Return a specific flag indicating a popup was killed
+            return (-1, -1, -1, -1)
+        # -------------------------------------------------------------
 
         screen_width = max(1, self.maatouch.max_x)
         screen_height = max(1, self.maatouch.max_y)
@@ -2097,11 +2140,31 @@ def run_fleet_replay(
             try:
                 report = future.result()
 
-                print(
-                    f"\n=== Replay Report [{serial}] ==="
-                )
+                print(f"\n=== Replay Report [{serial}] ===")
+                print(f"[*] Persona: {report.get('persona', 'Unknown')} | Text Rate: {report.get('text_input_wpm', 0)} WPM | Vigor: {report.get('flick_vigor', 0)}x")
+                print(f"[*] Status:  {report.get('completed_steps', 0)} / {report.get('total_steps', 0)} steps completed successfully.\n")
 
-                print(json.dumps(report, indent=2))
+                for step in report.get("steps", []):
+                    s_id = f"{step.get('step_id', 0):02d}"
+                    s_type = step.get("type", "UNKNOWN")
+                    status = step.get("status", "FAILED")
+                    
+                    if status == "PASSED":
+                        mark = "[+]"
+                        if s_type == "TEXT_INPUT" and "text_input" in step:
+                            ti = step["text_input"]
+                            details = f"({ti.get('characters', 0)} chars physically typed @ {ti.get('wpm_achieved', 0.0)} WPM)"
+                        else:
+                            details = f"(Target matched via {step.get('match_tier', 'N/A')})"
+                    elif status == "SKIPPED_TARGET_ALREADY_VISIBLE":
+                        mark = "[*]"
+                        details = "(Skipped: Target is already visible on screen)"
+                    else:
+                        mark = "[!]"
+                        details = f"- FAILED: {step.get('reason', 'Unknown error')}"
+                        
+                    print(f"    {mark} Step {s_id} | {s_type:<10} {details}")
+                print("\n======================================\n")
 
             except Exception as exc:
                 print(
