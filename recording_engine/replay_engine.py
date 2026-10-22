@@ -488,6 +488,7 @@ class PhysicalKeyboardInjector:
                 elif semantic == "shift" and "shift" in rid: found = True
                 elif semantic in ("sym_switch", "alpha_switch") and any(t in rid for t in ("key_pos_switch", "symbol", "mode_change")): found = True
                 elif semantic == "enter" and any(t in rid for t in ("enter", "action")): found = True
+                elif len(semantic) == 1 and semantic.isalnum() and f"key_pos_{semantic}" in rid: found = True
             if not found: continue
 
             l, t, r, b = node["bounds"]
@@ -495,41 +496,51 @@ class PhysicalKeyboardInjector:
             if w > node["screen_w"] * (0.80 if semantic == "space" else 0.28) or h > 0.16 * node["screen_h"]: continue
             matches.append(node)
 
-        if not matches and semantic in ("sym_switch", "alpha_switch") and nodes:
-            bl_cands = [n for n in nodes if n["bounds"][0] < n["screen_w"]*0.22 and (n["bounds"][1]+n["bounds"][3])/2 > n["screen_h"]*0.84]
-            if bl_cands:
-                bl_cands.sort(key=lambda n: (-n["bounds"][3], n["bounds"][0]))
-                return bl_cands[0]["bounds"], bl_cands[0]["attrs"]
-
         if not matches:
             raise RuntimeError(f"Key '{key_name}' not found on layer '{self._current_kb_layer}'.")
+        
         matches.sort(key=lambda n: (n["area"], n["clickable_rank"]))
         return matches[0]["bounds"], matches[0]["attrs"]
 
     def _tap_android_keyboard_key(self, key_name: str):
-        bounds, attrs = self._find_keyboard_key(key_name)
-        l, t, r, b = bounds
-        x, y = int((l + r) / 2), int((t + b) / 2)
+        try:
+            bounds, attrs = self._find_keyboard_key(key_name)
+            l, t, r, b = bounds
+            x, y = int((l + r) / 2), int((t + b) / 2)
+        except RuntimeError:
+            x, y = self._fallback_key_point(key_name)
+            attrs = {}
+
         pressure = max(1, min(int(self.maatouch.max_pressure), 75))
-        # Ensure we write a clean, atomic MaaTouch command batch so it never hangs
-        self.maatouch._send(f"d 0 {x} {y} {pressure}\nc\nw 22\nu 0\nc\n")
-        time.sleep(0.025)
+        # BUMP: 45ms tap duration bypasses OEM palm-rejection filters on system keys
+        self.maatouch._send(f"d 0 {x} {y} {pressure}\nc\nw 45\nu 0\nc\n")
+        time.sleep(0.050)
         return attrs
 
     def _switch_keyboard_layer(self, target_layer: str):
-        if self._current_kb_layer == target_layer: return
+        if self._current_kb_layer == target_layer: 
+            return
+            
         if target_layer == "alpha":
             self._tap_android_keyboard_key("alpha_switch")
+            time.sleep(0.25)  # Wait for keyboard morph animation to settle
             self._current_kb_layer = "alpha"
+            
         elif target_layer == "sym1":
-            if self._current_kb_layer == "alpha": self._tap_android_keyboard_key("sym_switch")
-            elif self._current_kb_layer == "sym2": self._tap_android_keyboard_key("sym_switch")
+            if self._current_kb_layer == "alpha": 
+                self._tap_android_keyboard_key("sym_switch")
+                time.sleep(0.25)
+            elif self._current_kb_layer == "sym2": 
+                self._tap_android_keyboard_key("sym_switch")
+                time.sleep(0.25)
             self._current_kb_layer = "sym1"
+            
         elif target_layer == "sym2":
             if self._current_kb_layer == "alpha":
                 self._tap_android_keyboard_key("sym_switch")
-                time.sleep(0.14)
+                time.sleep(0.25)
             self._tap_android_keyboard_key("more_sym_switch")
+            time.sleep(0.25)
             self._current_kb_layer = "sym2"
 
         if target_layer not in self._keyboard_layer_caches:
@@ -591,6 +602,39 @@ class PhysicalKeyboardInjector:
             self._load_keyboard_nodes(force_fresh=True)
             self._tap_android_keyboard_key(character)
 
+    def _fallback_key_point(self, key_name: str) -> tuple[int, int]:
+        """Geometric fallback for completely obfuscated OEM keyboards."""
+        semantic = str(key_name).strip().lower()
+        width, height = max(1, int(self.maatouch.max_x)), max(1, int(self.maatouch.max_y))
+        layer = self._current_kb_layer
+
+        # REVERTED Y-COORDINATES: Restored to original values for perfect row alignment
+        if semantic in {"space", "spacebar", "space bar", " "}: x, y = 0.535, 0.910
+        elif semantic in {"enter", "return", "search", "done", "↵"}: x, y = 0.935, 0.910
+        elif semantic in {"backspace", "delete", "erase", "⌫"}: x, y = 0.925, 0.840
+        elif semantic in {"shift", "caps lock"}: x, y = 0.080, 0.840
+        elif semantic in {"sym_switch", "alpha_switch", "?123", "abc"}: x, y = 0.110, 0.900
+        elif semantic in {"more_sym_switch", "=\\<"}: x, y = 0.110, 0.840
+        elif layer == "sym2" and semantic == "<": x, y = 0.170, 0.910
+        elif layer == "sym2" and semantic == ">": x, y = 0.820, 0.910
+        elif semantic in {",", "comma"}: x, y = 0.215, 0.910
+        elif semantic in {".", "dot", "period"}: x, y = 0.820, 0.910
+        elif layer == "alpha" and len(key_name) == 1 and semantic in "qwertyuiop": x, y = ("qwertyuiop".index(semantic) + 0.5) / 10.0, 0.720
+        elif layer == "alpha" and len(key_name) == 1 and semantic in "asdfghjkl": x, y = ("asdfghjkl".index(semantic) + 1.0) / 10.0, 0.780
+        elif layer == "alpha" and len(key_name) == 1 and semantic in "zxcvbnm": x, y = 0.18 + "zxcvbnm".index(semantic) * 0.092, 0.840
+        elif layer == "sym2" and len(key_name) == 1 and semantic in "~`|•√π÷×§δ": x, y = ("~`|•√π÷×§δ".index(semantic) + 0.5) / 10.0, 0.720
+        elif layer == "sym2" and len(key_name) == 1 and semantic in "€¥$¢^°−{}\\": x, y = ("€¥$¢^°−{}\\".index(semantic) + 0.5) / 10.0, 0.780
+        elif layer == "sym2" and len(key_name) == 1 and semantic in "%©®™✓[]": x, y = {"%": 0.05, "©": 0.17, "®": 0.29, "™": 0.41, "✓": 0.55, "[": 0.67, "]": 0.78}[semantic], 0.840
+        elif layer == "sym1" and len(key_name) == 1 and semantic in "1234567890": x, y = ("1234567890".index(semantic) + 0.5) / 10.0, 0.720
+        elif layer == "sym1" and len(key_name) == 1 and semantic in "@#₹_&-+()/": x, y = ("@#₹_&-+()/".index(semantic) + 0.5) / 10.0, 0.780
+        elif layer == "sym1" and len(key_name) == 1 and semantic in "*\"':;!?": x, y = [0.22, 0.34, 0.43, 0.53, 0.63, 0.73, 0.82]["*\"':;!?".index(semantic)], 0.840
+        elif layer == "sym1" and len(key_name) == 1 and semantic == "_": x, y = 0.35, 0.780
+        elif layer == "sym1" and len(key_name) == 1 and semantic == "-": x, y = 0.55, 0.780
+        elif layer == "sym1" and len(key_name) == 1 and semantic == "+": x, y = 0.65, 0.780
+        else: raise RuntimeError(f"No geometric fallback for '{key_name}' on layer '{layer}'.")
+
+        return int(round(x * width)), int(round(y * height))
+    
 # =====================================================================
 # 2. SINGLE-DEVICE REPLAY WORKER
 # =====================================================================
