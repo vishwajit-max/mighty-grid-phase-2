@@ -681,7 +681,13 @@ class RecorderMainWindow(QMainWindow):
         if event_type in {"TAP", "LONG_PRESS"} and trajectory:
             point = trajectory[0]
             anchor = getattr(step, "anchor", None)
-            anchor_text = str(getattr(anchor, "text", "") or "").strip()
+            # Android keyboards often expose key labels as content-desc rather
+            # than text. Prefer those before falling back to raw coordinates.
+            anchor_text = str(
+                getattr(anchor, "text", "")
+                or getattr(anchor, "content_desc", "")
+                or ""
+            ).strip()
             if anchor_text:
                 if len(anchor_text) > 24:
                     anchor_text = anchor_text[:21] + "..."

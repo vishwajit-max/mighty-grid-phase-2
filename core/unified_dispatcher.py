@@ -17,7 +17,7 @@ from typing import Dict, Any, Optional
 # Resolve root path
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BROWSER_DIR = os.path.join(BASE_DIR, "Browser-Telemetry")
-ANDROID_DIR = os.path.join(BASE_DIR, "tele_without_env", "telemetry")
+ANDROID_DIR = os.path.join(BASE_DIR, "android_telemetry", "telemetry")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 
 os.makedirs(LOGS_DIR, exist_ok=True)
@@ -41,7 +41,15 @@ class UnifiedTelemetryRunner:
             if use_priming else "mighty_grid_orchestrator.py"
         )
         script_path = os.path.join(BROWSER_DIR, script_rel)
-        
+        if not os.path.isfile(script_path):
+            return {
+                "platform": "browser",
+                "target": target_url,
+                "status": "ERROR",
+                "error": f"Browser runner is missing: {script_path}. The supplied project contains only the priming orchestrator.",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            }
+
         cmd = [sys.executable, script_path, "--url", target_url]
         if proxy:
             cmd.extend(["--proxy", proxy])
@@ -96,7 +104,15 @@ class UnifiedTelemetryRunner:
         print(f"[*] Starting Android Telemetry Job on target package: {package}")
         
         script_path = os.path.join(ANDROID_DIR, "mighty_grid_run.py")
-        
+        if not os.path.isfile(script_path):
+            return {
+                "platform": "android",
+                "target": package,
+                "status": "ERROR",
+                "error": f"Android telemetry runner is missing: {script_path}",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            }
+
         cmd = [sys.executable, script_path, "-p", package, "--persona", persona]
         if serial:
             cmd.extend(["-s", serial])

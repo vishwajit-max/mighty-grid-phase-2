@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -250,22 +252,94 @@ def roll_persona(archetype: str):
 
 @app.get("/api/recordings")
 def list_recordings():
+    """Return recordings newest-first using the exported recording.json timestamp.
+
+    Session folder names are random IDs, so sorting paths lexicographically does
+    not represent recording time. The recording.json file is written when the
+    session is exported, making its filesystem mtime the best available time
+    source when older session JSON files have no timestamp field.
+    """
     recordings_root = REC_DIR / "recordings"
     found = []
     if recordings_root.exists():
-        for rec_file in sorted(recordings_root.rglob("recording.json"), reverse=True):
+        for rec_file in recordings_root.rglob("recording.json"):
             try:
                 data = json.loads(rec_file.read_text(encoding="utf-8"))
+                recorded_at = rec_file.stat().st_mtime
                 found.append({
                     "id": data.get("session_id", rec_file.parent.name),
                     "path": str(rec_file),
                     "label": f"{rec_file.parent.name} ({data.get('total_steps', 0)} steps)",
                     "source_serial": data.get("source_device_serial", "Unknown"),
-                    "steps": data.get("total_steps", 0)
+                    "steps": data.get("total_steps", 0),
+                    "recorded_at": recorded_at,
                 })
-            except Exception:
-                pass
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                # Ignore incomplete or unreadable session exports without
+                # preventing the remaining recordings from appearing.
+                continue
+
+    # Newest session first. The UI applies the same stable sort as a safeguard.
+    found.sort(key=lambda recording: recording["recorded_at"], reverse=True)
     return {"recordings": found}
+
+
+@app.delete("/api/recordings/{recording_id}")
+def delete_recording(recording_id: str):
+    """Delete one saved session directory, including its recording.json and crops."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", recording_id):
+        raise HTTPException(status_code=400, detail="Invalid recording ID.")
+
+    # Prevent removal of a file that the replay engine may still be reading.
+    with STATE_LOCK:
+        replay_proc = ACTIVE_STATE.get("replay_proc")
+        if replay_proc is not None and replay_proc.poll() is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Stop the active replay before deleting a recording.",
+            )
+
+    recordings_root = (REC_DIR / "recordings").resolve()
+    if not recordings_root.exists():
+        raise HTTPException(status_code=404, detail="No recordings directory exists.")
+
+    matches = []
+    for rec_file in recordings_root.rglob("recording.json"):
+        try:
+            data = json.loads(rec_file.read_text(encoding="utf-8"))
+            record_id = str(data.get("session_id") or rec_file.parent.name)
+            if record_id == recording_id:
+                matches.append(rec_file.resolve())
+        except (OSError, json.JSONDecodeError):
+            continue
+
+    if not matches:
+        raise HTTPException(status_code=404, detail="Recording not found.")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Multiple recordings share this ID; deletion was cancelled for safety.",
+        )
+
+    recording_file = matches[0]
+    session_dir = recording_file.parent.resolve()
+    # Strict containment checks: never allow deletion of the recordings root or
+    # anything outside it, even if a recording or symlink was tampered with.
+    if session_dir == recordings_root or recordings_root not in session_dir.parents:
+        raise HTTPException(status_code=403, detail="Unsafe recording path; deletion refused.")
+    if recording_file.name != "recording.json" or not recording_file.is_file():
+        raise HTTPException(status_code=400, detail="Invalid recording file.")
+
+    try:
+        shutil.rmtree(session_dir)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not delete session directory: {exc}",
+        ) from exc
+
+    print(f"[+] Deleted recording session {recording_id} ({session_dir.name}).")
+    return {"status": "DELETED", "id": recording_id, "deleted_directory": session_dir.name}
 
 
 # ---------------------------------------------------------------------
@@ -388,6 +462,19 @@ async def start_replay(req: ReplayRequest):
             if not req.lockstep:
                 cmd.append("--no-lockstep")
 
+            print(
+                f"[*] Replay entrypoint: {replay_script.resolve()} | "
+                f"exists={replay_script.is_file()}",
+                flush=True,
+            )
+            print(
+                f"[*] Replay target: recording={Path(req.recording_path).resolve()} | "
+                f"devices={','.join(req.serials)} | persona={req.persona}",
+                flush=True,
+            )
+            if not replay_script.is_file():
+                raise FileNotFoundError(f"Replay engine not found: {replay_script}")
+
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(REC_DIR),
@@ -399,11 +486,32 @@ async def start_replay(req: ReplayRequest):
             with STATE_LOCK:
                 ACTIVE_STATE["replay_proc"] = proc
 
-            # LogBroadcaster will automatically intercept this print and route it to the UI
-            for line in proc.stdout:
+            # Popen.stdout is typed as optional; make the PIPE contract explicit
+            # before iterating so a missing stream is reported as a fatal error.
+            if proc.stdout is None:
+                raise RuntimeError("Replay subprocess stdout pipe was not created.")
+            output_stream = proc.stdout
+
+            # Capture evidence that the expected engine really ran and emitted a report.
+            saw_engine_build = False
+            saw_replay_report = False
+            saw_step_activity = False
+            saw_fleet_pass = False
+            saw_fleet_failure = False
+            for line in output_stream:
                 msg = line.strip()
                 if msg:
-                    print(msg)
+                    if "Replay engine build:" in msg:
+                        saw_engine_build = True
+                    if "=== Replay Report [" in msg:
+                        saw_replay_report = True
+                    if "[+] FLEET REPLAY PASSED:" in msg:
+                        saw_fleet_pass = True
+                    if "[!] FLEET REPLAY FAILED:" in msg:
+                        saw_fleet_failure = True
+                    if "Step " in msg and (" started." in msg or " status=" in msg):
+                        saw_step_activity = True
+                    print(msg, flush=True)
 
             proc.wait()
 
@@ -411,11 +519,32 @@ async def start_replay(req: ReplayRequest):
                 was_aborted = ACTIVE_STATE["aborted"]
 
             if was_aborted:
-                print("[!] Replay aborted by user.")
+                print("[!] Replay aborted by user.", flush=True)
+            elif saw_fleet_failure:
+                print("[!] Fleet replay reported failed or unexecuted steps.", flush=True)
+            elif not saw_engine_build:
+                print(
+                    "[!] Replay process ended without the expected engine build marker. "
+                    "Check the logged entrypoint and restart the correct API backend.",
+                    flush=True,
+                )
+            elif not saw_replay_report:
+                print(
+                    f"[!] Replay process exited without a per-device replay report "
+                    f"(code={proc.returncode}, step_activity={saw_step_activity}). "
+                    "The run is not considered successful.",
+                    flush=True,
+                )
+            elif not saw_fleet_pass:
+                print(
+                    f"[!] Replay did not emit the required all-steps-passed marker "
+                    f"(exit code={proc.returncode}). This run is NOT marked successful.",
+                    flush=True,
+                )
             elif proc.returncode == 0:
-                print("[+] Fleet replay execution finished.")
+                print("[+] Fleet replay verified: all recorded steps passed.", flush=True)
             else:
-                print(f"[!] Replay process exited with code {proc.returncode}.")
+                print(f"[!] Replay process exited with code {proc.returncode}; replay FAILED.", flush=True)
 
         except Exception as exc:
             print(f"[!] Fatal Replay Error: {exc}")
